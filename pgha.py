@@ -5,6 +5,7 @@ import os
 import pwd
 import re
 import sys
+import syslog
 import tempfile
 from collections import defaultdict, OrderedDict
 from datetime import datetime
@@ -118,10 +119,7 @@ meta-data
 validate-all"""
 ACTION = sys.argv[1] if len(sys.argv) > 1 else None
 _logtag = None
-
-
-def hadate():
-    return datetime.now().strftime(os.environ.get('HA_DATEFMT', '%Y/%m/%d_%T'))
+_ocf_nodename = None
 
 
 def get_pguser():
@@ -188,53 +186,39 @@ def get_crm_node():
 def get_logtag():
     global _logtag
     if not _logtag:
-        _logtag = "{}:{}({})[{}]".format(
-            PROGRAM, ACTION, os.environ['OCF_RESOURCE_INSTANCE'], os.getpid())
+        _logtag = "{}({})({})[{}]".format(
+            PROGRAM, os.environ['OCF_RESOURCE_INSTANCE'], ACTION, os.getpid())
+        if os.environ.get('HA_LOGFACILITY'):
+            syslog.openlog(str(_logtag))
     return _logtag
 
 
-def ocf_log(level, msg, *args):
-    LOG_TAG = get_logtag()
-    l = level + ": " + msg.format(*args)
-    if os.environ.get('HA_LOGFACILITY', 'none') == 'none':
-        os.environ['HA_LOGFACILITY'] = ""
-    ha_logfacility = os.environ.get('HA_LOGFACILITY', "")
-    # if we're connected to a tty, then output to stderr
+def ocf_log(level, level_str, msg, *args):
+    base_l = "{}: {}\n".format(level_str, msg.format(*args))
+    full_l = datetime.now().strftime('%b %d %X ') + get_logtag() + ": " + base_l
     if sys.stderr.isatty():
-        sys.stderr.write("{}: {}\n".format(LOG_TAG, l))
+        sys.stderr.write(full_l)
         return 0
-    if os.environ.get('HA_LOGD', "") == 'yes':
-        if call(['ha_logger', '-t', LOG_TAG, l]) == 0:
-            return 0
-    if ha_logfacility != "":  # logging through syslog
-        if level in ("ERROR", "CRIT"):
-            level = "err"
-        elif level == "WARNING":
-            level = "warning"
-        elif level == "INFO":
-            level = "info"
-        elif level == "DEBUG":
-            level = "debug"
-        else:  # loglevel is unknown, use 'notice' for now
-            level = "notice"
-        call(["logger", "-t", LOG_TAG, "-p", ha_logfacility + "." + level, l])
+    log_facility = os.environ.get('HA_LOGFACILITY')
+    if log_facility:  # == "daemon":
+        syslog.syslog(level, base_l)
     ha_logfile = os.environ.get("HA_LOGFILE")
     if ha_logfile:
         with open(ha_logfile, "a") as f:
-            f.write("{}: {} {}\n".format(LOG_TAG, hadate(), l))
-    elif not ha_logfacility:
-        sys.stderr.write("{} {}\n".format(hadate(), l))
+            f.write(full_l)
+    elif not log_facility:
+        sys.stderr.write(full_l)
     ha_debuglog = get_ha_debuglog()
     if ha_debuglog and ha_debuglog != ha_logfile:
         with open(ha_debuglog, "a") as f:
-            f.write("{}: {} {}\n".format(LOG_TAG, hadate(), l))
+            f.write(full_l)
 
 
-log_crit = partial(ocf_log, "CRIT")
-log_err = partial(ocf_log, "ERROR")
-log_warn = partial(ocf_log, "WARNING")
-log_info = partial(ocf_log, "INFO")
-log_debug = partial(ocf_log, "DEBUG")
+log_crit = partial(ocf_log, syslog.LOG_CRIT, "critical")
+log_err = partial(ocf_log, syslog.LOG_ERR, "error")
+log_warn = partial(ocf_log, syslog.LOG_WARNING, "warning")
+log_info = partial(ocf_log, syslog.LOG_INFO, "info")
+log_debug = partial(ocf_log, syslog.LOG_DEBUG, "debug")
 
 
 def get_attrd_updater():
@@ -273,10 +257,13 @@ def run_pgctrldata():
 
 
 def get_ocf_nodename():
-    try:
-        return check_output([get_crm_node(), "-n"]).strip()
-    except CalledProcessError:
-        sys.exit(OCF_ERR_GENERIC)
+    global _ocf_nodename
+    if not _ocf_nodename:
+        try:
+            _ocf_nodename = check_output([get_crm_node(), "-n"]).strip()
+        except CalledProcessError:
+            sys.exit(OCF_ERR_GENERIC)
+    return _ocf_nodename
 
 
 def run_pgisready():
