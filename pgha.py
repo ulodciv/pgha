@@ -697,20 +697,17 @@ def delete_replication_slots():
 def confirm_this_node_should_be_promoted():
     """ Find out if this node is truly the one to promote. If not, also update
     the scores.
-    The standby with the highest master score gets promoted, as set during the
-    last monitor on the previous master (see set_standbies_scores). Confirm
-    that these scores are still correct in that this node still has the most
-    advance WAL record. All slaves should all have set the "replay_location"
-    resource attribute during pre-promote.
-    Return True if this node has the highest replay_location LSN, False
-    otherwise """
+    The standby with the highest master score gets promoted, as set by the
+    master during the last monitor (see set_standbies_scores). Confirm that
+    these scores are still correct in that this node still has the most advanced
+    WAL record. All slaves should have set "replay_lsn" during pre-promote.
+    Return True if this node is to be promoted, False otherwise """
     log_debug("checking if current node is the best for promotion")
-    # Exclude nodes that are known to be unavailable (not in the current
-    # partition) using the "crm_node" command
+    # Exclude nodes that are not in the current partition
     active_nodes = get_ha_private_attr("nodes").split()
     local_node = get_ocf_nodename()
     node_to_promote = local_node
-    local_lsn = get_ha_private_attr("replay_location")  # set during pre-promote
+    local_lsn = get_ha_private_attr("replay_lsn")  # set during pre-promote
     if local_lsn == "":
         log_crit("no replay location LSN for this node")
         return False
@@ -720,7 +717,7 @@ def confirm_this_node_should_be_promoted():
     log_debug("replay location LSN for this node: {}", local_lsn)
     # Now we compare with the other available nodes.
     for node in (n for n in active_nodes if n != local_node):
-        node_lsn = get_ha_private_attr("replay_location", node)  # set during pre-promote
+        node_lsn = get_ha_private_attr("replay_lsn", node)
         if node_lsn == "":
             log_crit("no replay location LSN for {}", node)
             return False
@@ -731,8 +728,6 @@ def confirm_this_node_should_be_promoted():
             node_to_promote = node
             highest_lsn = node_lsn
             log_debug("{}'s replay location is higher", node)
-    # If any node has been selected, we adapt the master scores accordingly
-    # and break the current promotion.
     if node_to_promote != local_node:
         log_info("{} is the best standby to promote, aborting promotion",
                  node_to_promote)
@@ -744,7 +739,7 @@ def confirm_this_node_should_be_promoted():
 
 
 def del_private_attributes():
-    del_ha_private_attr("replay_location")
+    del_ha_private_attr("replay_lsn")
     del_ha_private_attr("master_promotion")
     del_ha_private_attr("nodes")
     del_ha_private_attr("cancel_promotion")
@@ -766,24 +761,24 @@ def notify_pre_promote(nodes):
 
     # FIXME: should we allow a switchover to a lagging standby?
 
-    # We need to trigger an election between existing slaves to promote the best
-    # one based on its current LSN location. The designated standby for
-    # promotion is responsible to connect to each available nodes to check their
-    # "replay_location".
-    # ocf_promote will use this information to check if the instance to promote
-    # is the best one, so we can avoid a race condition between the last
-    # successful monitor on the previous master and the current promotion.
-    rc, rs = pg_execute("SELECT pg_last_xlog_replay_location()")
+    # Run an election among slaves to promote the best one based on replay LSNs.
+    # This information is used during ocf_promote to check if the promoted node
+    # is the best one. If not, the promotion will be "cancelled" (which will
+    # allow the best slave to be promoted subsequently)
+    if get_pg_version() >= LooseVersion("10"):
+        rc, rs = pg_execute("SELECT pg_last_wal_replay_lsn()")
+    else:
+        rc, rs = pg_execute("SELECT pg_last_xlog_replay_location()")
     if rc != 0:
-        log_warn("could not get replay location LSN")
+        log_warn("could not get WAL replay LSN")
         # Return codes are ignored during notifications...
         return OCF_SUCCESS
     node_lsn = rs[0][0]
-    log_info("replay location LSN: {}", node_lsn)
-    # Set the "replay_location" attribute value for this node so we can use it
+    log_info("WAL replay LSN: {}", node_lsn)
+    # Set the "replay_lsn" attribute value for this node so we can use it
     # during the following "promote" action.
-    if not set_ha_private_attr("replay_location", node_lsn):
-        log_warn("could not set the replay location LSN")
+    if not set_ha_private_attr("replay_lsn", node_lsn):
+        log_warn("could not set the WAL replay LSN")
     # If this node is the future master, keep track of the slaves that received
     # the same notification to compare our LSN with them during promotion
     active_nodes = defaultdict(int)
@@ -872,6 +867,27 @@ def notify_pre_stop(nodes):
     return OCF_SUCCESS
 
 
+_pg_version = None
+
+
+def get_pg_version():
+    global _pg_version
+    if not _pg_version:
+        ver_file = os.path.join(get_pgdata(), "PG_VERSION")
+        try:
+            with open(ver_file) as fh:
+                ver = fh.read()
+        except Exception as e:
+            log_crit("Can't read PG version file: {}", ver_file, e)
+            sys.exit(OCF_ERR_ARGS)
+        try:
+            _pg_version = LooseVersion(ver)
+        except:
+            log_crit("Can't parse PG version: {}", ver)
+            sys.exit(OCF_ERR_ARGS)
+    return _pg_version
+
+
 def ocf_validate_all():
     for prog in [get_pgctl(), get_psql(), get_pgisready(), get_pgctrldata()]:
         if not os.access(prog, os.X_OK):
@@ -882,18 +898,7 @@ def ocf_validate_all():
         log_err("PGDATA {} not found".format(datadir))
         sys.exit(OCF_ERR_ARGS)
     # check PG_VERSION
-    pgver_file = os.path.join(datadir, "PG_VERSION")
-    try:
-        with open(pgver_file) as fh:
-            ver = fh.read()
-    except Exception as e:
-        log_crit("Can't read PG version file: {}", pgver_file, e)
-        sys.exit(OCF_ERR_ARGS)
-    try:
-        ver = LooseVersion(ver)
-    except:
-        log_crit("Can't parse PG version: {}", ver)
-        sys.exit(OCF_ERR_ARGS)
+    ver = get_pg_version()
     if ver < MIN_PG_VER:
         log_err("PostgreSQL {} is too old: >= {} required", ver, MIN_PG_VER)
         sys.exit(OCF_ERR_INSTALLED)
@@ -1128,12 +1133,12 @@ def ocf_demote():
     start it back """
     rc = get_ocf_state()
     if rc == OCF_RUNNING_MASTER:
-        log_debug("PG running as a master")
+        log_debug("PG is running as a master")
     elif rc == OCF_SUCCESS:
-        log_debug("PG running as a standby")
+        log_debug("PG is running as a standby")
         return OCF_SUCCESS
     elif rc == OCF_NOT_RUNNING:
-        log_debug("PG already stopped stopped")
+        log_debug("PG is already stopped")
     elif rc == OCF_ERR_CONFIGURED:
         # We actually prefer raising a hard or fatal error instead of leaving
         # the CRM abording its transition for a new one because of a soft error.
@@ -1231,7 +1236,7 @@ if __name__ == "__main__":
             log_and_exit(ocf_stop())
         if ACTION == "monitor":
             log_and_exit(ocf_monitor())
-        if ACTION == "promote":  # makes it a master
+        if ACTION == "promote":
             log_and_exit(ocf_promote())
         if ACTION == "demote":
             log_and_exit(ocf_demote())
