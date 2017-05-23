@@ -240,9 +240,11 @@ def get_ha_private_attr(name, node=None):
     return m[0]
 
 
-def set_ha_private_attr(name, val):
-    return call(
-        [get_attrd_updater(), "-U", val, "-n", name, "-p", "-d", "0"]) == 0
+def set_ha_private_attr(name, val, node=None):
+    cmd = [get_attrd_updater(), "-U", val, "-n", name, "-p", "-d", "0"]
+    if node:
+        cmd.extend(["-N", node])
+    return call(cmd) == 0
 
 
 def del_ha_private_attr(name):
@@ -401,7 +403,7 @@ def is_master_or_standby():
     if rc == 0:
         is_in_recovery = rs[0][0]
         if is_in_recovery == "t":
-            log_debug("PG is a running as s standby")
+            log_debug("PG is a running as a standby")
             return OCF_SUCCESS
         else:  # is_in_recovery == "f":
             log_debug("PG is running as a master")
@@ -464,6 +466,11 @@ def pg_ctl_status():
     return as_postgres([get_pgctl(), "status", "-D", get_pgdata()])
 
 
+def pg_ctl_restart():
+    return as_postgres(
+        [get_pgctl(), "restart", "-D", get_pgdata(), "-w", "-t", 1000000])
+
+
 def pg_ctl_start():
     # long timeout to ensure Pacemaker gives up first
     return as_postgres([get_pgctl(), "start", "-D", get_pgdata(), "-w",
@@ -522,12 +529,27 @@ def confirm_stopped():
     return OCF_ERR_GENERIC
 
 
-def create_recovery_conf():
+def replace_conninfo_host(recovery_conf, new_host):
+    """
+    :param recovery_conf: recovery.conf content
+    :param new_host: if None, remove primary_conninfo setting
+    :return: updated recovery.conf content
+    """
+    if not new_host:
+        return re.sub("\s*primary_conninfo(.*?)\n", "\n", recovery_conf)
+    else:
+        return re.sub("(\s*primary_conninfo\s*=\s*'.*)host=[^ \t']+(.*\n)",
+                      r"\1host={}\2".format(new_host), recovery_conf)
+
+
+def create_recovery_conf(master):
     """ Write recovery.conf. It must include:
     standby_mode = on
     primary_conninfo = 'host=<VIP> port=5432 user=repl1'
     recovery_target_timeline = latest
-    primary_slot_name = <node_name> """
+    primary_slot_name = <node_name>
+
+    """
     u = pwd.getpwnam(get_pguser())
     uid, gid = u.pw_uid, u.pw_gid
     recovery_file = os.path.join(get_pgdata(), "recovery.conf")
@@ -539,15 +561,22 @@ def create_recovery_conf():
     try:
         with open(recovery_tpl) as fh:
             # Copy all parameters from the template file
-            recovery_conf = fh.read()
+            recovery_conf_tpl = fh.read()
     except:
         log_crit("can't open {}", recovery_tpl)
         sys.exit(OCF_ERR_CONFIGURED)
-    log_debug("writing {}", recovery_file)
     try:
-        # Write recovery.conf using configuration from the template file
+        with open(recovery_file) as fh:
+            recovery_conf_old = fh.read()
+    except:
+        recovery_conf_old = None
+    log_debug("writing {}", recovery_file)
+    recovery_conf_new = replace_conninfo_host(recovery_conf_tpl, master)
+    if recovery_conf_old == recovery_conf_new:
+        return False
+    try:
         with open(recovery_file, "w") as fh:
-            fh.write(recovery_conf)
+            fh.write(recovery_conf_new)
     except:
         log_crit("can't open {}", recovery_file)
         sys.exit(OCF_ERR_CONFIGURED)
@@ -556,6 +585,7 @@ def create_recovery_conf():
     except:
         log_crit("can't set owner of {}", recovery_file)
         sys.exit(OCF_ERR_CONFIGURED)
+    return True
 
 
 def get_promotion_score(node=None):
@@ -755,7 +785,7 @@ def notify_pre_promote(nodes):
         log_warn("this is a master recovery")
         if promoting == node:
             set_ha_private_attr("master_promotion", "1")
-        return OCF_SUCCESS
+        return
 
     del_private_attributes()
 
@@ -772,7 +802,7 @@ def notify_pre_promote(nodes):
     if rc != 0:
         log_warn("could not get WAL replay LSN")
         # Return codes are ignored during notifications...
-        return OCF_SUCCESS
+        return
     node_lsn = rs[0][0]
     log_info("WAL replay LSN: {}", node_lsn)
     # Set the "replay_lsn" attribute value for this node so we can use it
@@ -790,40 +820,7 @@ def notify_pre_promote(nodes):
             active_nodes[uname] -= 1
         attr_nodes = " ".join(k for k in active_nodes if active_nodes[k] > 0)
         set_ha_private_attr("nodes", attr_nodes)
-    return OCF_SUCCESS
-
-
-def notify_pre_demote(nodes):
-    # do nothing if the local node will not be demoted
-    node = get_ocf_nodename()
-    if node not in nodes["demote"]:
-        return OCF_SUCCESS
-    rc = get_ocf_state()
-    # do nothing if this is not a master recovery
-    master_recovery = node in nodes["master"] and node in nodes["promote"]
-    if not master_recovery or rc != OCF_FAILED_MASTER:
-        return OCF_SUCCESS
-    # in case of master crash, we need to detect if the CRM tries to recover
-    # the master clone. The usual transition is to do:
-    #   demote->stop->start->promote
-    #
-    # There are multiple flaws with this transition:
-    #  * the 1st and 2nd actions will fail because the instance is in
-    #    OCF_FAILED_MASTER step
-    #  * the usual start action is dangerous as the instance will start with
-    #    a recovery.conf instead of entering a normal recovery process
-    #
-    # To avoid this, we try to start the instance in recovery from here.
-    # If it success, at least it will be demoted correctly with a normal
-    # status. If it fails, it will be catched up in next steps.
-    log_info("trying to start PG failing master")
-    # Either the instance managed to start or it couldn't.
-    # We rely on the pg_ctk '-w' switch to take care of this. If it couldn't
-    # start, this error will be catched up later during the various checks
-    pg_ctl_start()
-    log_info("state is '{}' after recovery attempt",
-             get_pgctrldata_state())
-    return OCF_SUCCESS
+    return
 
 
 def notify_pre_start(nodes):
@@ -831,22 +828,30 @@ def notify_pre_start(nodes):
         - add any missing replication slots
         - kill any active orphaned wal sender
     Return OCF_SUCCESS (sole possibility AFAICT) """
-    if get_ocf_nodename() in nodes["master"]:
+    this_node = get_ocf_nodename()
+    if this_node in nodes["master"]:
         add_replication_slots(nodes["start"])
         kill_wal_senders(nodes["start"])
-    return OCF_SUCCESS
+        for node in nodes["start"]:
+            if node == this_node:
+                continue
+            set_ha_private_attr("prestart_master", this_node, node)
+
+
+def notify_post_start(nodes):
+    del_ha_private_attr("prestart_master")
 
 
 def notify_pre_stop(nodes):
     node = get_ocf_nodename()
     # do nothing if the local node will not be stopped
     if node not in nodes["stop"]:
-        return OCF_SUCCESS
+        return
     rc = get_non_transitional_pg_state()
     # do nothing if this is not a standby recovery
     standby_recovery = node in nodes["slave"] and node in nodes["start"]
     if not standby_recovery or rc != OCF_SUCCESS:
-        return OCF_SUCCESS
+        return
     # in case of standby crash, we need to detect if the CRM tries to recover
     # the slaveclone. The usual transition is to do: stop->start
     #
@@ -864,7 +869,6 @@ def notify_pre_stop(nodes):
     pg_ctl_start()
     log_info("state is '{}' after recovery attempt",
              get_pgctrldata_state())
-    return OCF_SUCCESS
 
 
 _pg_version = None
@@ -955,14 +959,14 @@ def ocf_start():
     if rc != OCF_NOT_RUNNING:
         log_err("unexpected PG state: {}", rc)
         return OCF_ERR_GENERIC
-    return start_pg_as_standby()
+    return start_pg_as_standby(get_ha_private_attr("prestart_master"))
 
 
-def start_pg_as_standby():
+def start_pg_as_standby(master):
     # From here, the instance is NOT running
     prev_state = get_pgctrldata_state()
     log_debug("starting PG as a standby")
-    create_recovery_conf()
+    create_recovery_conf(master)
     rc = pg_ctl_start()
     if rc != 0:
         log_err("failed to start PG, rc: {}", rc)
@@ -1128,35 +1132,42 @@ def get_ocf_state():
     return OCF_ERR_GENERIC
 
 
+def notify_pre_demote(nodes):
+    # do nothing if the local node will not be demoted
+    node = get_ocf_nodename()
+    if node not in nodes["demote"]:
+        return
+    rc = get_ocf_state()
+    # do nothing if this is not a master recovery
+    master_recovery = node in nodes["master"] and node in nodes["promote"]
+    if not master_recovery or rc != OCF_FAILED_MASTER:
+        return
+    # in case of master crash, we need to detect if the CRM tries to recover
+    # the master clone. The usual transition is to do:
+    #   demote->stop->start->promote
+    #
+    # There are multiple flaws with this transition:
+    #  * the 1st and 2nd actions will fail because the instance is in
+    #    OCF_FAILED_MASTER step
+    #  * the usual start action is dangerous as the instance will start with
+    #    a recovery.conf instead of entering a normal recovery process
+    #
+    # To avoid this, we try to start the instance in recovery from here.
+    # If it succeeds, at least it will be demoted correctly with a normal
+    # status.
+    # pg_ctl '-w' ensures the OCF action fails by timeout if the start takes too
+    # long. If it couldn't start, this failure will be picked up later on.
+    log_info("trying to start failed PG master")
+    pg_ctl_start()
+    log_info("state is '{}' after recovery attempt", get_pgctrldata_state())
+
+
 def ocf_demote():
     """ Demote PG from master to standby: stop PG, create recovery.conf and
     start it back """
     rc = get_ocf_state()
     if rc == OCF_RUNNING_MASTER:
-        log_debug("PG is running as a master")
-    elif rc == OCF_SUCCESS:
-        log_debug("PG is running as a standby")
-        return OCF_SUCCESS
-    elif rc == OCF_NOT_RUNNING:
-        log_debug("PG is already stopped")
-    elif rc == OCF_ERR_CONFIGURED:
-        # We actually prefer raising a hard or fatal error instead of leaving
-        # the CRM abording its transition for a new one because of a soft error.
-        # The hard error will force the CRM to move the resource immediately.
-        return OCF_ERR_CONFIGURED
-    else:
-        return OCF_ERR_GENERIC
-    # TODO we need to make sure at least one standby is connected!!
-    # WARNING if the resource state is stopped instead of master, the ocf ra dev
-    # rsc advises to return OCF_ERR_GENERIC, misleading the CRM in a loop where
-    # it computes transitions of demote(failing)->stop->start->promote actions
-    # until failcount == migration-threshold.
-    # This is a really ugly trick to keep going with the demode action if the
-    # rsc is already stopped gracefully.
-    # See discussion "CRM trying to demote a stopped resource" on
-    # developers@clusterlabs.org
-    if rc != OCF_NOT_RUNNING:
-        # insanely long timeout to ensure Pacemaker gives up firt
+        log_info("Normal demotion")
         rc = pg_ctl_stop()
         if rc != 0:
             log_err("failed to stop PG (pg_ctl exited with {})", rc)
@@ -1165,13 +1176,25 @@ def ocf_demote():
         rc = get_ocf_state()
         if rc != OCF_NOT_RUNNING:
             log_err("unexpected state: monitor status "
-                    "({}) disagree with pg_ctl return code", rc)
+                    "({}) disagrees with pg_ctl return code", rc)
             return OCF_ERR_GENERIC
-    rc = start_pg_as_standby()
+    elif rc == OCF_SUCCESS:
+         return OCF_SUCCESS
+    elif rc == OCF_NOT_RUNNING:
+        log_warn("PG is already stopped")  # an error should be returned
+        # return OCF_ERR_GENERIC
+    elif rc == OCF_ERR_CONFIGURED:
+        # We prefer raising a hard error instead of letting the CRM abort and
+        # start another transition due to a soft error.
+        # The hard error will force the CRM to move the resource immediately.
+        return OCF_ERR_CONFIGURED
+    else:
+        return OCF_ERR_GENERIC
+    rc = start_pg_as_standby(master=None)
     if rc == OCF_SUCCESS:
         log_info("PG started as a standby")
         return OCF_SUCCESS
-    log_err("failed to start PG as standby (returned {})", rc)
+    log_err("failed to start PG as a standby (returned {})", rc)
     return OCF_ERR_GENERIC
 
 
@@ -1189,21 +1212,42 @@ def get_notify_dict():
     return d
 
 
+def notify_post_promote(nodes):
+    del_private_attributes()
+    this_node = get_ocf_nodename()
+    if (this_node in (nodes["slave"] + nodes["start"] + nodes["demote"]) and
+            this_node not in nodes["promote"]):
+        # restart only if master changed
+        if not create_recovery_conf(nodes["promote"][0]):
+            log_info("PG already replicates from the correct master, "
+                     "no need to restart it")
+            return
+        rc = pg_ctl_restart()
+        if rc != 0:
+            log_err("failed to restart PG, rc: {}", rc)
+            return
+        if is_master_or_standby() != OCF_SUCCESS:
+            log_err("PG is not running as a standby (returned {})", rc)
+            return
+        log_info("PG re-started")
+
+
 def ocf_notify():
     d = get_notify_dict()
     log_debug("{}", json.dumps(d, indent=4))
     type_op = d["type"] + "-" + d["operation"]
     if type_op == "pre-promote":
-        return notify_pre_promote(d["nodes"])
-    if type_op == "post-promote":
-        del_private_attributes()
-        return OCF_SUCCESS
-    if type_op == "pre-demote":
-        return notify_pre_demote(d["nodes"])
-    if type_op == "pre-stop":
-        return notify_pre_stop(d["nodes"])
-    if type_op == "pre-start":
-        return notify_pre_start(d["nodes"])
+        notify_pre_promote(d["nodes"])
+    elif type_op == "post-promote":
+        notify_post_promote(d["nodes"])
+    elif type_op == "pre-demote":
+        notify_pre_demote(d["nodes"])
+    elif type_op == "pre-stop":
+        notify_pre_stop(d["nodes"])
+    elif type_op == "pre-start":
+        notify_pre_start(d["nodes"])
+    elif type_op == "post-start":
+        notify_post_start(d["nodes"])
     return OCF_SUCCESS
 
 

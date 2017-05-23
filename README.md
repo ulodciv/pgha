@@ -6,11 +6,25 @@ multi-state Pacemaker Resource Agent (RA) for Postgresql.
 ##  Some differences between PAF (pgsqlms) and pgha
 
 - pgha uses replication slots, pgsqlms does not
-- pgsqlms needs application_name to be set in primary_conninfo in recovery.conf, pgha does not
+- when promoting a master:
+    - pgha:
+        - updates 'host' in 'primary_conninfo' in recovery.conf on slaves
+        - restarts Postgresql on slaves
+    - pgsqlms:
+        - doesn't modify recovery.conf, 'host' is set to the virtual IP (VIP)
+        - lets pacemaker move the VIP resource to the new master
+        - the slaves eventually reconnect to the new master using the VIP: the 
+        slaves are not restarted
+- pgsqlms needs application_name to be set in primary_conninfo in recovery.conf, 
+pgha does not
 - pgha requires PG >= 9.6, pgsqlms requires PG >= 9.3
-- pgha gets WAL LSN from pg_last_xlog_replay_location, pgsqlms gets it from pg_last_xlog_receive_location
-- pgsqlms sets a negative score to standbies that lag too much (lag > maxlag), pgha does not
-- pgsqlms checks, during pre-promote, that the slave being promoted has the shutdown checkpoint, pgha does not.
+- pgha gets WAL LSN from pg_last_xlog_replay_location, pgsqlms gets it from 
+pg_last_xlog_receive_location
+- pgsqlms sets a negative score to standbies that lag too much (lag > maxlag), 
+pgha does not
+- pgsqlms checks, during pre-promote, that the slave being promoted has the 
+shutdown checkpoint, pgha does not
+
 
 ## TODO
 

@@ -20,7 +20,7 @@ def get_distro():
     return p.findall(s)[0].upper()
 
 
-pgversion = "9.6"
+pgversion = "10"
 INST = "foo"
 os.environ['OCF_RESOURCE_INSTANCE'] = INST
 linux_distro = get_distro()
@@ -200,9 +200,9 @@ primary_conninfo = 'port={}'
         self.assertEqual(0, rc)
 
     def test_confirm_stopped(self):
-        self.assertEqual(RA.OCF_NOT_RUNNING, RA.confirm_stopped(INST))
+        self.assertEqual(RA.OCF_NOT_RUNNING, RA.confirm_stopped())
         self.start_pg_slave()
-        self.assertEqual(RA.OCF_ERR_GENERIC, RA.confirm_stopped(INST))
+        self.assertEqual(RA.OCF_ERR_GENERIC, RA.confirm_stopped())
 
     def test_get_pg_ctl_status(self):
         self.assertEqual(3, RA.pg_ctl_status())
@@ -223,7 +223,10 @@ primary_conninfo = 'port={}'
 
     def test_pg_execute(self):
         self.start_pg_slave()
-        rc, rs = RA.pg_execute("SELECT pg_last_xlog_receive_location()")
+        if pgversion == "10":
+            rc, rs = RA.pg_execute("SELECT pg_last_wal_replay_lsn()")
+        else:
+            rc, rs = RA.pg_execute("SELECT pg_last_xlog_replay_location()")
         self.assertEqual(0, rc)
         rc, rs = RA.pg_execute("SELECT 25")
         self.assertEqual(0, rc)
@@ -233,10 +236,10 @@ primary_conninfo = 'port={}'
         self.assertEqual([], rs)
 
     def test_get_ocf_status_from_pg_cluster_state(self):
-        ocf_status = RA.get_non_transitional_pg_state(INST)
+        ocf_status = RA.get_non_transitional_pg_state()
         self.assertEqual(ocf_status, RA.OCF_NOT_RUNNING)
         self.start_pg_slave()
-        ocf_status = RA.get_non_transitional_pg_state(INST)
+        ocf_status = RA.get_non_transitional_pg_state()
         self.assertEqual(ocf_status, RA.OCF_SUCCESS)
 
     def test_validate_all(self):
@@ -337,7 +340,7 @@ class TestHa(unittest.TestCase):
         print(json.dumps(d, indent=4))
 
 
-class TestRegExes(unittest.TestCase):
+class TestSimpleFunctions(unittest.TestCase):
     TPL = """\
 primary_conninfo = 'user={} host=127.0.0.1 port=15432'
 recovery_target_timeline = 'latest'
@@ -350,16 +353,41 @@ Database cluster state:               in production
 pg_control last modified:             Fri 31 Mar 2017 10:01:29 PM CEST
 """
 
+    def test_replace_conninfo_host(self):
+        s = """\
+standby_mode = on
+primary_conninfo = 'host=host1 port=5432 user=repl1'
+recovery_target_timeline = latest
+primary_slot_name = host3
+"""
+        s1_expected = """\
+standby_mode = on
+recovery_target_timeline = latest
+primary_slot_name = host3
+"""
+        s2_expected = """\
+standby_mode = on
+primary_conninfo = 'host=foo.bar port=5432 user=repl1'
+recovery_target_timeline = latest
+primary_slot_name = host3
+"""
+        s1 = RA.replace_conninfo_host(s, "")
+        self.assertEqual(s1_expected, s1)
+        s1 = RA.replace_conninfo_host(s, None)
+        self.assertEqual(s1_expected, s1)
+        s2 = RA.replace_conninfo_host(s, "foo.bar")
+        self.assertEqual(s2_expected, s2)
+
     def test_tpl_file(self):
-        m = re.search(RA.RE_TPL_TIMELINE, TestRegExes.TPL, re.M)
+        m = re.search(RA.RE_TPL_TIMELINE, self.TPL, re.M)
         self.assertIsNotNone(m)
 
     def test_tpl_slot(self):
-        finds = re.findall(RA.RE_TPL_SLOT, TestRegExes.TPL, re.M)
+        finds = re.findall(RA.RE_TPL_SLOT, self.TPL, re.M)
         self.assertAlmostEqual(finds[0], "foo")
 
     def test_pg_cluster_state(self):
-        m = re.findall(RA.RE_PG_CLUSTER_STATE, TestRegExes.cluster_state, re.M)
+        m = re.findall(RA.RE_PG_CLUSTER_STATE, self.cluster_state, re.M)
         self.assertIsNotNone(m)
         self.assertEqual(m[0], "in production")
 
