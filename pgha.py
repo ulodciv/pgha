@@ -120,6 +120,7 @@ validate-all"""
 ACTION = sys.argv[1] if len(sys.argv) > 1 else None
 _logtag = None
 _ocf_nodename = None
+_pg_version = None
 
 
 def get_pguser():
@@ -487,46 +488,16 @@ def backup_label_exists():
     return os.path.isfile(os.path.join(get_pgdata(), "backup_label"))
 
 
-def confirm_stopped():
-    """ PG is really stopped and it was propertly shut down """
+def confirm_stopped_with_pg_ctl_status():
+    """ PG is really stopped """
     # Check the postmaster process status.
     pgctlstatus_rc = pg_ctl_status()
     if pgctlstatus_rc == 0:
         # The PID file exists and the process is available.
         # That should not be the case, return an error.
         log_err("PG is not listening, but the process in postmaster.pid exists")
-        return OCF_ERR_GENERIC
-    # The PID file does not exist or the process is not available.
-    log_debug("no PG server process found")
-    if backup_label_exists():
-        log_debug("found backup_label: indicates a never started backup")
-        return OCF_NOT_RUNNING
-    # Continue the check with pg_controldata.
-    controldata_rc = get_non_transitional_pg_state()
-    if controldata_rc == OCF_RUNNING_MASTER:
-        # The controldata has not been updated to "shutdown".
-        # It should mean we had a crash on a master instance.
-        log_err("PG's controldata indicates a running "
-                "master, the instance has probably crashed")
-        return OCF_FAILED_MASTER
-    elif controldata_rc == OCF_SUCCESS:
-        # The controldata has not been updated to "shutdown in recovery".
-        # It should mean we had a crash on a standby instance.
-        # There is no "FAILED_SLAVE" return code, so we return a generic error.
-        log_warn(
-            "PG appears to be a crashed standby, let's pretend all is good "
-            "so that Pacemaker tries to start it back as-is")
-        return OCF_NOT_RUNNING
-    elif controldata_rc == OCF_NOT_RUNNING:
-        # The controldata state is consistent, the instance was probably
-        # propertly shut down.
-        log_debug("PG's controldata indicates "
-                  "that the instance was propertly shut down")
-        return OCF_NOT_RUNNING
-    # Something went wrong with the controldata check.
-    log_err("couldn't get PG's status from controldata (returned {})",
-            controldata_rc)
-    return OCF_ERR_GENERIC
+        return False
+    return True
 
 
 def replace_conninfo_host(recovery_conf, new_host):
@@ -627,13 +598,11 @@ def set_promotion_score(score, node=None):
 def ocf_promote():
     state = is_master_or_standby()
     if state == OCF_RUNNING_MASTER:
-        # Already a master. Unexpected, presumably ok.
         log_warn("PG already running as a master")
         return OCF_SUCCESS
     elif state != OCF_SUCCESS:
         log_err("Unexpected error, cannot promote this node")
         return OCF_ERR_GENERIC
-    # Running as standby. Normal, expected behavior.
     log_debug("PG running as a standby")
     # Cancel if it has been considered unsafe during pre-promote
     if get_ha_private_attr("cancel_promotion") == "1":
@@ -842,38 +811,6 @@ def notify_post_start(nodes):
     del_ha_private_attr("prestart_master")
 
 
-def notify_pre_stop(nodes):
-    node = get_ocf_nodename()
-    # do nothing if the local node will not be stopped
-    if node not in nodes["stop"]:
-        return
-    rc = get_non_transitional_pg_state()
-    # do nothing if this is not a standby recovery
-    standby_recovery = node in nodes["slave"] and node in nodes["start"]
-    if not standby_recovery or rc != OCF_SUCCESS:
-        return
-    # in case of standby crash, we need to detect if the CRM tries to recover
-    # the slaveclone. The usual transition is to do: stop->start
-    #
-    # This transition can not work because the instance is in
-    # OCF_ERR_GENERIC step. So the stop action will fail, leading most
-    # probably to fencing action.
-    #
-    # To avoid this, we try to start the instance in recovery from here.
-    # If it succeeds, at least it will be stopped correctly with a normal
-    # status. If it fails, it will be catched up in next steps.
-    log_info("starting standby that was not shutdown cleanly")
-    # Either the instance managed to start or it couldn't.
-    # We rely on the pg_ctl '-w' switch to take care of this. If it couldn't
-    # start, this error will be catched up later during the various checks
-    pg_ctl_start()
-    log_info("state is '{}' after recovery attempt",
-             get_pgctrldata_state())
-
-
-_pg_version = None
-
-
 def get_pg_version():
     global _pg_version
     if not _pg_version:
@@ -991,13 +928,14 @@ def start_pg_as_standby(master):
 def ocf_stop():
     """ Return OCF_SUCCESS or OCF_ERR_GENERIC """
     rc = get_ocf_state()
+    # is_master_or_standby
     if rc == OCF_NOT_RUNNING:
         log_info("PG already stopped")
         return OCF_SUCCESS
     elif rc not in (OCF_SUCCESS, OCF_RUNNING_MASTER):
         log_warn("unexpected PG state: {}", rc)
         return OCF_ERR_GENERIC
-    # From here, the instance is running for sure.
+    # From here, the instance is running for sure
     log_debug("PG is running, stopping it")
     # Try to quit with proper shutdown.
     # insanely long timeout to ensure Pacemaker gives up first
@@ -1055,10 +993,10 @@ def ocf_monitor():
         if state in ("shut down",  # was a Master
                      "shut down in recovery"  # was a standby
                      ):
-            log_debug("shutdown was graceful, all good")
-            return OCF_NOT_RUNNING
-        log_err("shutdown was not graceful")
-        return OCF_ERR_GENERIC
+            log_debug("shutdown was graceful")
+        else:
+            log_warn("shutdown was not graceful")
+        return OCF_NOT_RUNNING
     log_err("unexpected pg_isready exit code {} ", pgisready_rc)
     return OCF_ERR_GENERIC
 
@@ -1106,7 +1044,10 @@ def get_ocf_state():
                 # We check the process status using pg_ctl status and check
                 # if it was propertly shut down using pg_controldata.
                 log_debug("PG is not listening")
-                return confirm_stopped()
+                if confirm_stopped_with_pg_ctl_status():
+                    return OCF_NOT_RUNNING
+                else:
+                    return OCF_ERR_GENERIC
             # Still not consistent, raise an error.
             # TODO raise an hard error here ?
             log_err("PG's controldata is not consistent "
@@ -1121,7 +1062,10 @@ def get_ocf_state():
         # We check the process status using pg_ctl status and check
         # if it was propertly shut down using pg_controldata.
         log_debug("PG is not listening")
-        return confirm_stopped()
+        if confirm_stopped_with_pg_ctl_status():
+            return OCF_NOT_RUNNING
+        else:
+            return OCF_ERR_GENERIC
     elif pgisready_rc == 3:
         # No attempt was done, probably a syntax error.
         # Hard configuration error, we don't want to retry or failover here.
@@ -1179,7 +1123,7 @@ def ocf_demote():
                     "({}) disagrees with pg_ctl return code", rc)
             return OCF_ERR_GENERIC
     elif rc == OCF_SUCCESS:
-         return OCF_SUCCESS
+        return OCF_SUCCESS
     elif rc == OCF_NOT_RUNNING:
         log_warn("PG is already stopped")  # an error should be returned
         # return OCF_ERR_GENERIC
