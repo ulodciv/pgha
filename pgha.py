@@ -744,6 +744,17 @@ def del_private_attributes():
     del_ha_private_attr("cancel_promotion")
 
 
+def get_replay_lsn():
+    if get_pg_version() >= LooseVersion("10"):
+        rc, rs = pg_execute("SELECT pg_last_wal_replay_lsn()")
+    else:
+        rc, rs = pg_execute("SELECT pg_last_xlog_replay_location()")
+    if rc != 0:
+        log_warn("could not get WAL replay LSN")
+        return None
+    return rs[0][0]
+
+
 def notify_pre_promote(nodes):
     node = get_ocf_nodename()
     promoting = nodes["promote"][0]
@@ -764,15 +775,9 @@ def notify_pre_promote(nodes):
     # This information is used during ocf_promote to check if the promoted node
     # is the best one. If not, the promotion will be "cancelled" (which will
     # allow the best slave to be promoted subsequently)
-    if get_pg_version() >= LooseVersion("10"):
-        rc, rs = pg_execute("SELECT pg_last_wal_replay_lsn()")
-    else:
-        rc, rs = pg_execute("SELECT pg_last_xlog_replay_location()")
-    if rc != 0:
-        log_warn("could not get WAL replay LSN")
-        # Return codes are ignored during notifications...
+    node_lsn = get_replay_lsn()
+    if node_lsn is None:
         return
-    node_lsn = rs[0][0]
     log_info("WAL replay LSN: {}", node_lsn)
     # Set the "replay_lsn" attribute value for this node so we can use it
     # during the following "promote" action.
@@ -789,7 +794,6 @@ def notify_pre_promote(nodes):
             active_nodes[uname] -= 1
         attr_nodes = " ".join(k for k in active_nodes if active_nodes[k] > 0)
         set_ha_private_attr("nodes", attr_nodes)
-    return
 
 
 def notify_pre_start(nodes):
@@ -1174,6 +1178,30 @@ def notify_post_promote(nodes):
             log_err("PG is not running as a standby (returned {})", rc)
             return
         log_info("PG re-started")
+    elif this_node in nodes["promote"]:
+        if is_master_or_standby() != OCF_RUNNING_MASTER:
+            log_err("PG is not running as a master")
+            return
+        slaves = (set(nodes["start"]) | set(nodes["slave"])) - set(nodes["promote"])
+        if not slaves:
+            return
+        slots = ", ".join("'" + s.replace('-', '_') + "'" for s in slaves)
+        q = ("SELECT slot_name "
+             "FROM pg_replication_slots "
+             "WHERE slot_name in ({}) AND active AND slot_type='physical' "
+             "ORDER BY restart_lsn").format(slots)
+        while True:
+            rc, rs = pg_execute(q)
+            if rc != 0:
+                log_err("failed to get replication slots info")
+                return
+            elif len(rs) == len(slaves):
+                break
+            log_debug("Not all standbies are replicating: expecting {}, got {}",
+                      slots, rs)
+            sleep(1)
+        log_info("all standbies are replicating, set their promotion scores")
+        set_standbies_scores()
 
 
 def ocf_notify():
@@ -1186,13 +1214,11 @@ def ocf_notify():
         notify_post_promote(d["nodes"])
     elif type_op == "pre-demote":
         notify_pre_demote(d["nodes"])
-    elif type_op == "pre-stop":
-        notify_pre_stop(d["nodes"])
     elif type_op == "pre-start":
         notify_pre_start(d["nodes"])
     elif type_op == "post-start":
         notify_post_start(d["nodes"])
-    return OCF_SUCCESS
+    return log_and_exit(OCF_SUCCESS)
 
 
 def log_and_exit(code):
