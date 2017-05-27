@@ -16,6 +16,10 @@ from subprocess import call, check_output, CalledProcessError, STDOUT
 from tempfile import gettempdir
 from time import sleep
 
+
+# http://clusterlabs.org/doc/en-US/Pacemaker/1.1/html/Pacemaker_Explained/_proper_interpretation_of_notification_environment_variables.html
+# http://clusterlabs.org/doc/en-US/Pacemaker/1.1/html/Pacemaker_Explained/_proper_interpretation_of_multi_state_notification_environment_variables.html
+
 VERSION = "1.0"
 PROGRAM = "pgha"
 MIN_PG_VER = LooseVersion('9.6')
@@ -234,7 +238,7 @@ def get_ha_private_attr(name, node=None):
         ans = check_output(cmd)
     except CalledProcessError:
         return ""
-    p = re.compile(r'^name=".*" host=".*" value="(.*)"$')
+    p = re.compile(r'^name=".*"\s+host=".*"\s+value="(.*)"$')
     m = p.findall(ans)
     if not m:
         return ""
@@ -249,6 +253,7 @@ def set_ha_private_attr(name, val, node=None):
 
 
 def del_ha_private_attr(name):
+    # option "-p" must be present, but I don't know why
     return call([get_attrd_updater(), "-D", "-n", name, "-p", "-d", "0"]) == 0
 
 
@@ -503,13 +508,15 @@ def confirm_stopped_with_pg_ctl_status():
 def replace_conninfo_host(recovery_conf, new_host):
     """
     :param recovery_conf: recovery.conf content
-    :param new_host: if None, remove primary_conninfo setting
+    :param new_host: if None/empty, return conf as received
     :return: updated recovery.conf content
     """
-    if not new_host:
+    if new_host == get_ocf_nodename():
         return re.sub("\s*primary_conninfo(.*?)\n", "\n", recovery_conf)
+    elif not new_host:
+        return recovery_conf
     else:
-        return re.sub("(\s*primary_conninfo\s*=\s*'.*)host=[^ \t']+(.*\n)",
+        return re.sub("(\s*primary_conninfo\s*=\s*'.*)host=[^ \t']*(.*\n)",
                       r"\1host={}\2".format(new_host), recovery_conf)
 
 
@@ -525,7 +532,6 @@ def create_recovery_conf(master):
     uid, gid = u.pw_uid, u.pw_gid
     recovery_file = os.path.join(get_pgdata(), "recovery.conf")
     recovery_tpl = get_recovery_pcmk()
-    log_debug("get replication configuration from template {}", recovery_tpl)
     # primary_conninfo often has a virtual IP to reach the master. There is no
     # master available at startup, so standbies will complain about failing to
     # connect. This is normal.
@@ -541,11 +547,13 @@ def create_recovery_conf(master):
             recovery_conf_old = fh.read()
     except:
         recovery_conf_old = None
-    log_debug("writing {}", recovery_file)
     recovery_conf_new = replace_conninfo_host(recovery_conf_tpl, master)
+    log_debug("previous {}:\n{}", recovery_file, recovery_conf_old)
     if recovery_conf_old == recovery_conf_new:
+        log_debug("{} already as wanted, no need to udpate it", recovery_file)
         return False
     try:
+        log_debug("writing updated {}:\n{}", recovery_file, recovery_conf_new)
         with open(recovery_file, "w") as fh:
             fh.write(recovery_conf_new)
     except:
@@ -609,6 +617,7 @@ def ocf_promote():
         log_err("Promotion was cancelled during pre-promote")
         del_ha_private_attr("cancel_promotion")
         return OCF_ERR_GENERIC
+    active_nodes = get_ha_private_attr("active_nodes").split()
     # Do not check for a better candidate if we try to recover the master
     # Recovery of a master is detected during pre-promote. It is signaled by
     # setting the 'master_promotion' flag.
@@ -619,13 +628,16 @@ def ocf_promote():
         # The best standby to promote has the highest LSN. If this node
         # is not the best one, we need to modify the master scores accordingly,
         # and abort the current promotion
-        if not confirm_this_node_should_be_promoted():
+        if not confirm_this_node_should_be_promoted(active_nodes):
             return OCF_ERR_GENERIC
+
     # replication slots can be added on hot standbies, helps ensuring no WAL is
-    # missed after promotion
-    if not add_replication_slots(get_ha_nodes()):
+    # missed upon promotion
+    slave_nodes = [n for n in active_nodes if n != get_ocf_nodename()]
+    if not add_replication_slots(slave_nodes):
         log_err("failed to add all replication slots")
         return OCF_ERR_GENERIC
+
     if as_postgres([get_pgctl(), "promote", "-D", get_pgdata()]) != 0:
         # Promote the instance on the current node.
         log_err("'pg_ctl promote' failed")
@@ -647,14 +659,15 @@ def add_replication_slots(slave_nodes):
             continue  # TODO: is this check necessary?
         slot = node.replace('-', '_')
         if slot in slots:
+            log_debug("replication slot '{}' exists already".format(slot))
             continue
         rc, rs = pg_execute(
-            "SELECT * FROM pg_create_physical_replication_slot('{}', true)".format(
+            "SELECT pg_create_physical_replication_slot('{}', true)".format(
                 slot))
         if rc != 0:
-            log_err("failed to add replication slot {}".format(slot))
+            log_err("failed to add replication slot '{}'".format(slot))
             return False
-        log_debug("added replication slot {}".format(slot))
+        log_debug("added replication slot '{}'".format(slot))
     return True
 
 
@@ -693,7 +706,7 @@ def delete_replication_slots():
     return True
 
 
-def confirm_this_node_should_be_promoted():
+def confirm_this_node_should_be_promoted(active_nodes):
     """ Find out if this node is truly the one to promote. If not, also update
     the scores.
     The standby with the highest master score gets promoted, as set by the
@@ -703,30 +716,29 @@ def confirm_this_node_should_be_promoted():
     Return True if this node is to be promoted, False otherwise """
     log_debug("checking if current node is the best for promotion")
     # Exclude nodes that are not in the current partition
-    active_nodes = get_ha_private_attr("nodes").split()
     local_node = get_ocf_nodename()
     node_to_promote = local_node
     local_lsn = get_ha_private_attr("replay_lsn")  # set during pre-promote
     if local_lsn == "":
-        log_crit("no replay location LSN for this node")
+        log_crit("no replay LSN for this node")
         return False
     # convert LSN to a pair of integers
     local_lsn = [int(v, 16) for v in local_lsn.split("/")]
     highest_lsn = local_lsn
-    log_debug("replay location LSN for this node: {}", local_lsn)
+    log_debug("replay LSN for this node: {}", local_lsn)
     # Now we compare with the other available nodes.
     for node in (n for n in active_nodes if n != local_node):
         node_lsn = get_ha_private_attr("replay_lsn", node)
         if node_lsn == "":
-            log_crit("no replay location LSN for {}", node)
+            log_crit("no replay LSN for {}", node)
             return False
-        # convert location to decimal
+        # convert LSN to decimal
         node_lsn = [int(v, 16) for v in node_lsn.split("/")]
-        log_debug("replay location LSN for {}: {}", node, node_lsn)
+        log_debug("replay LSN for {}: {}", node, node_lsn)
         if node_lsn > highest_lsn:
             node_to_promote = node
             highest_lsn = node_lsn
-            log_debug("{}'s replay location is higher", node)
+            log_debug("{}'s replay LSN is higher", node)
     if node_to_promote != local_node:
         log_info("{} is the best standby to promote, aborting promotion",
                  node_to_promote)
@@ -740,7 +752,7 @@ def confirm_this_node_should_be_promoted():
 def del_private_attributes():
     del_ha_private_attr("replay_lsn")
     del_ha_private_attr("master_promotion")
-    del_ha_private_attr("nodes")
+    del_ha_private_attr("active_nodes")
     del_ha_private_attr("cancel_promotion")
 
 
@@ -756,14 +768,11 @@ def get_replay_lsn():
 
 
 def notify_pre_promote(nodes):
-    node = get_ocf_nodename()
-    promoting = nodes["promote"][0]
-    log_info("{} will be promoted", promoting)
-
+    this_node = get_ocf_nodename()
     # No need to do an election between slaves if this is recovery of the master
-    if promoting in nodes["master"]:
+    if nodes["promote"] & nodes["master"]:
         log_warn("this is a master recovery")
-        if promoting == node:
+        if this_node in nodes["promote"]:
             set_ha_private_attr("master_promotion", "1")
         return
 
@@ -785,15 +794,11 @@ def notify_pre_promote(nodes):
         log_warn("could not set the WAL replay LSN")
     # If this node is the future master, keep track of the slaves that received
     # the same notification to compare our LSN with them during promotion
-    active_nodes = defaultdict(int)
-    if promoting == node:
-        # build the list of active nodes:  master + slave + start - stop
-        for uname in chain(nodes["master"], nodes["slave"], nodes["start"]):
-            active_nodes[uname] += 1
-        for uname in nodes["stop"]:
-            active_nodes[uname] -= 1
-        attr_nodes = " ".join(k for k in active_nodes if active_nodes[k] > 0)
-        set_ha_private_attr("nodes", attr_nodes)
+    if this_node in nodes["promote"]:
+        active_nodes = (
+            (nodes["master"] - nodes["demote"]) |  # master
+            (((nodes["slave"] | nodes["demote"]) - nodes["stop"]) | nodes["start"]))  # slaves
+        set_ha_private_attr("active_nodes", " ".join(active_nodes))
 
 
 def notify_pre_start(nodes):
@@ -802,12 +807,14 @@ def notify_pre_start(nodes):
         - kill any active orphaned wal sender
     Return OCF_SUCCESS (sole possibility AFAICT) """
     this_node = get_ocf_nodename()
-    if this_node in nodes["master"]:
+    if this_node in nodes["master"] and this_node not in nodes["demote"]:
         add_replication_slots(nodes["start"])
         kill_wal_senders(nodes["start"])
         for node in nodes["start"]:
             if node == this_node:
                 continue
+            log_debug("setting attr 'prestart_master' as {} for node {}",
+                      this_node, node)
             set_ha_private_attr("prestart_master", this_node, node)
 
 
@@ -916,9 +923,9 @@ def start_pg_as_standby(master):
         log_err("PG is not running as a standby (returned {})", rc)
         return OCF_ERR_GENERIC
     log_info("PG started")
-    if not delete_replication_slots():
-        log_err("failed to delete replication slots")
-        return OCF_ERR_GENERIC
+    # if not delete_replication_slots():
+    #     log_err("failed to delete replication slots")
+    #     return OCF_ERR_GENERIC
     # On first cluster start, no score exists on standbies unless someone sets
     # them with crm_master. Without scores, the cluster won't promote any slave.
     # Fix that by setting a score of 1, but only if this node was a master
@@ -1150,24 +1157,40 @@ def get_notify_dict():
     d = OrderedDict()
     d["type"] = os.environ.get("OCF_RESKEY_CRM_meta_notify_type", "")
     d["operation"] = os.environ.get("OCF_RESKEY_CRM_meta_notify_operation", "")
-    d["nodes"] = defaultdict(list)
+    d["nodes"] = {
+        "stop": [],
+        "start": [],
+        "slave": [],
+        "master": [],
+        "demote": [],
+        "promote": [],
+        "all": [],
+        "available": [],
+        "inactive": []
+    }
     start, end = "OCF_RESKEY_CRM_meta_notify_", "_uname"
     for k, v in os.environ.items():
         if k.startswith(start) and k.endswith(end):
             action = k[len(start):-len(end)]
             if v.strip():
-                d["nodes"][action].extend(v.split())
+                if action not in d["nodes"]:
+                    log_warn("unknown action in {}", k)
+                else:
+                    d["nodes"][action].extend(v.split())
     return d
 
 
 def notify_post_promote(nodes):
     del_private_attributes()
     this_node = get_ocf_nodename()
-    if (this_node in (nodes["slave"] + nodes["start"] + nodes["demote"]) and
-            this_node not in nodes["promote"]):
+    promoted = nodes["promote"].copy().pop()
+    slaves = (((nodes["slave"] | nodes["demote"]) - nodes["stop"]) | nodes["start"]) - nodes["promote"]
+    if this_node in slaves:
+        # shed any replication slot
+        delete_replication_slots()
         # restart only if master changed
-        if not create_recovery_conf(nodes["promote"][0]):
-            log_info("PG already replicates from the correct master, "
+        if not create_recovery_conf(promoted):
+            log_info("PG already replicates from the current master, "
                      "no need to restart it")
             return
         rc = pg_ctl_restart()
@@ -1178,11 +1201,10 @@ def notify_post_promote(nodes):
             log_err("PG is not running as a standby (returned {})", rc)
             return
         log_info("PG re-started")
-    elif this_node in nodes["promote"]:
+    elif this_node == promoted:
         if is_master_or_standby() != OCF_RUNNING_MASTER:
             log_err("PG is not running as a master")
             return
-        slaves = (set(nodes["start"]) | set(nodes["slave"])) - set(nodes["promote"])
         if not slaves:
             return
         slots = ", ".join("'" + s.replace('-', '_') + "'" for s in slaves)
@@ -1206,7 +1228,12 @@ def notify_post_promote(nodes):
 
 def ocf_notify():
     d = get_notify_dict()
+    # ocf_dict = {k: os.environ[k]
+    #             for k in os.environ if k.startswith("OCF_RESKEY")}
+    # log_debug("{}", json.dumps(ocf_dict, indent=4))
     log_debug("{}", json.dumps(d, indent=4))
+    for state in list(d["nodes"]):
+        d["nodes"][state] = set(d["nodes"][state])
     type_op = d["type"] + "-" + d["operation"]
     if type_op == "pre-promote":
         notify_pre_promote(d["nodes"])
