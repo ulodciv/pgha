@@ -354,15 +354,18 @@ def set_standbies_scores():
     nodename = get_ocf_nodename()
     nodes_to_score = get_ha_nodes()
     rc, rs = pg_execute(
-        "SELECT slot_name, restart_lsn, active_pid FROM pg_replication_slots "
-        "WHERE active AND slot_type='physical' ORDER BY restart_lsn")
+        "SELECT T1.slot_name, T1.restart_lsn, T1.active_pid, T2.state \n"
+        "FROM pg_replication_slots AS T1 "
+        "LEFT OUTER JOIN pg_stat_replication AS T2 ON  T1.active_pid=T2.pid\n"
+        "WHERE T1.active AND T1.slot_type='physical' \n"
+        "ORDER BY T1.restart_lsn DESC")
     if rc != 0:
         log_err("failed to get replication slots info")
         sys.exit(OCF_ERR_GENERIC)
     # For each standby connected, set their master score based on the following
     # rule: the first known node, with the highest priority and
     # with an acceptable state.
-    for i, (slot_name, restart_lsn, active_pid) in enumerate(rs):
+    for i, (slot_name, restart_lsn, active_pid, state) in enumerate(rs):
         for node in nodes_to_score:
             if node.replace('-', '_') == slot_name:
                 node_to_score = node
@@ -370,16 +373,9 @@ def set_standbies_scores():
         else:
             log_info("ignoring unknown physical slot {}", slot_name)
             continue
-        rc, rs = pg_execute(
-            "SELECT state FROM pg_stat_replication WHERE pid={}".format(
-                active_pid))
-        if rc != 0:
-            log_err("failed to get replication slots info")
-            sys.exit(OCF_ERR_GENERIC)
-        state = rs[0][0].strip()
         if state in ("startup", "backup"):
-            # We exclude any standby being in state backup (pg_basebackup) or
-            # startup (new standby or failing standby)
+            # exclude standbies in state backup (pg_basebackup) or startup (new
+            # standby or failing standby)
             log_info("forbid promotion of {} because it has state '{}': "
                      "set its score to -1", node_to_score, state)
             set_promotion_score("-1", node_to_score)
