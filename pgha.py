@@ -7,18 +7,13 @@ import re
 import sys
 import syslog
 import tempfile
-from collections import defaultdict, OrderedDict
+from collections import OrderedDict
 from datetime import datetime
 from distutils.version import LooseVersion
 from functools import partial
-from itertools import chain
 from subprocess import call, check_output, CalledProcessError, STDOUT
 from tempfile import gettempdir
 from time import sleep
-
-
-# http://clusterlabs.org/doc/en-US/Pacemaker/1.1/html/Pacemaker_Explained/_proper_interpretation_of_notification_environment_variables.html
-# http://clusterlabs.org/doc/en-US/Pacemaker/1.1/html/Pacemaker_Explained/_proper_interpretation_of_multi_state_notification_environment_variables.html
 
 VERSION = "1.0"
 PROGRAM = "pgha"
@@ -837,6 +832,12 @@ def get_pg_version():
 
 
 def ocf_validate_all():
+    if int(os.environ.get("OCF_RESKEY_CRM_meta_clone_max", 0)) <= 0:
+        log_err("OCF_RESKEY_CRM_meta_clone_max should be >= 1")
+        sys.exit(OCF_ERR_CONFIGURED)
+    if os.environ.get("OCF_RESKEY_CRM_meta_master_max", "") != "1":
+        log_err("OCF_RESKEY_CRM_meta_master_max should == 1")
+        sys.exit(OCF_ERR_CONFIGURED)
     for prog in [get_pgctl(), get_psql(), get_pgisready(), get_pgctrldata()]:
         if not os.access(prog, os.X_OK):
             log_crit("{} is missing or not executable", prog)
@@ -1149,33 +1150,6 @@ def ocf_demote():
     return OCF_ERR_GENERIC
 
 
-def get_notify_dict():
-    d = OrderedDict()
-    d["type"] = os.environ.get("OCF_RESKEY_CRM_meta_notify_type", "")
-    d["operation"] = os.environ.get("OCF_RESKEY_CRM_meta_notify_operation", "")
-    d["nodes"] = {
-        "stop": [],
-        "start": [],
-        "slave": [],
-        "master": [],
-        "demote": [],
-        "promote": [],
-        "all": [],
-        "available": [],
-        "inactive": []
-    }
-    start, end = "OCF_RESKEY_CRM_meta_notify_", "_uname"
-    for k, v in os.environ.items():
-        if k.startswith(start) and k.endswith(end):
-            action = k[len(start):-len(end)]
-            if v.strip():
-                if action not in d["nodes"]:
-                    log_warn("unknown action in {}", k)
-                else:
-                    d["nodes"][action].extend(v.split())
-    return d
-
-
 def notify_post_promote(nodes):
     del_private_attributes()
     this_node = get_ocf_nodename()
@@ -1222,25 +1196,39 @@ def notify_post_promote(nodes):
         set_standbies_scores()
 
 
+def get_nofify_unames():
+    d = dict(all=[], inactive=[], available=[], slave=[], master=[],
+             stop=[], start=[], demote=[], promote=[])
+    start, end = "OCF_RESKEY_CRM_meta_notify_", "_uname"
+    for k, v in os.environ.items():
+        if k.startswith(start) and k.endswith(end):
+            action = k[len(start):-len(end)]
+            if v.strip():
+                if action not in d:
+                    log_warn("unknown action in {}", k)
+                else:
+                    d[action].extend(v.split())
+    return d
+
+
 def ocf_notify():
-    d = get_notify_dict()
-    # ocf_dict = {k: os.environ[k]
-    #             for k in os.environ if k.startswith("OCF_RESKEY")}
-    # log_debug("{}", json.dumps(ocf_dict, indent=4))
-    log_debug("{}", json.dumps(d, indent=4))
-    for state in list(d["nodes"]):
-        d["nodes"][state] = set(d["nodes"][state])
-    type_op = d["type"] + "-" + d["operation"]
+    # http://clusterlabs.org/doc/en-US/Pacemaker/1.1/html/Pacemaker_Explained/_proper_interpretation_of_multi_state_notification_environment_variables.html
+    type_op = (os.environ.get("OCF_RESKEY_CRM_meta_notify_type", "") + "-" +
+               os.environ.get("OCF_RESKEY_CRM_meta_notify_operation", ""))
+    unames = get_nofify_unames()
+    log_debug("{}:\n{}", type_op, json.dumps(unames, indent=2, sort_keys=True))
+    for state in list(unames):
+        unames[state] = set(unames[state])
     if type_op == "pre-promote":
-        notify_pre_promote(d["nodes"])
+        notify_pre_promote(unames)
     elif type_op == "post-promote":
-        notify_post_promote(d["nodes"])
+        notify_post_promote(unames)
     elif type_op == "pre-demote":
-        notify_pre_demote(d["nodes"])
+        notify_pre_demote(unames)
     elif type_op == "pre-start":
-        notify_pre_start(d["nodes"])
+        notify_pre_start(unames)
     elif type_op == "post-start":
-        notify_post_start(d["nodes"])
+        notify_post_start(unames)
     return log_and_exit(OCF_SUCCESS)
 
 
@@ -1257,12 +1245,6 @@ if __name__ == "__main__":
         print(OCF_METHODS)
         sys.exit()
     os.chdir(gettempdir())
-    if int(os.environ.get("OCF_RESKEY_CRM_meta_clone_max", 0)) <= 0:
-        log_err("OCF_RESKEY_CRM_meta_clone_max should be >= 1")
-        sys.exit(OCF_ERR_CONFIGURED)
-    if os.environ.get("OCF_RESKEY_CRM_meta_master_max", "") != "1":
-        log_err("OCF_RESKEY_CRM_meta_master_max should == 1")
-        sys.exit(OCF_ERR_CONFIGURED)
     if ACTION == "validate-all":
         log_and_exit(ocf_validate_all())
     if ACTION in ("start", "stop", "monitor", "promote", "demote", "notify"):
