@@ -7,7 +7,6 @@ import re
 import sys
 import syslog
 import tempfile
-from collections import OrderedDict
 from datetime import datetime
 from distutils.version import LooseVersion
 from functools import partial
