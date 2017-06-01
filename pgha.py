@@ -464,13 +464,15 @@ def pg_ctl_status():
 
 def pg_ctl_restart():
     return as_postgres(
-        [get_pgctl(), "restart", "-D", get_pgdata(), "-w", "-t", 1000000])
+        [get_pgctl(), "restart", "-D", get_pgdata(), "-w", "-t", 1000000,
+         "-l", "/dev/null"])
 
 
 def pg_ctl_start():
     # long timeout to ensure Pacemaker gives up first
-    return as_postgres([get_pgctl(), "start", "-D", get_pgdata(), "-w",
-                        "-t", 1000000, "-o", "-c config_file=" + get_pgconf()])
+    return as_postgres(
+        [get_pgctl(), "start", "-D", get_pgdata(), "-w", "-t", 1000000,
+         "-o", "-c config_file=" + get_pgconf(), "-l", "/dev/null"])
 
 
 def pg_ctl_stop():
