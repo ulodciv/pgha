@@ -146,10 +146,6 @@ def get_pgconf():
         "OCF_RESKEY_pgconf", os.path.join(get_pgdata(), "postgresql.conf"))
 
 
-def get_recovery_pcmk():
-    return os.path.join(get_pgdata(), "recovery.conf.pcmk")
-
-
 def get_pgctl():
     return os.path.join(get_pgbindir(), "pg_ctl")
 
@@ -497,57 +493,38 @@ def confirm_stopped_with_pg_ctl_status():
     return True
 
 
-def replace_conninfo_host(recovery_conf, new_host):
-    """
-    :param recovery_conf: recovery.conf content
-    :param new_host: if None/empty, return conf as received
-    :return: updated recovery.conf content
-    """
-    if new_host == get_ocf_nodename():
-        return re.sub("\s*primary_conninfo(.*?)\n", "\n", recovery_conf)
-    elif not new_host:
-        return recovery_conf
-    else:
-        return re.sub("(\s*primary_conninfo\s*=\s*'.*)host=[^ \t']*(.*\n)",
-                      r"\1host={}\2".format(new_host), recovery_conf)
-
-
 def create_recovery_conf(master):
     """ Write recovery.conf. It must include:
     standby_mode = on
     primary_conninfo = 'host=<VIP> port=5432 user=repl1'
     recovery_target_timeline = latest
     primary_slot_name = <node_name>
-
     """
     u = pwd.getpwnam(get_pguser())
     uid, gid = u.pw_uid, u.pw_gid
+    this_host = get_ocf_nodename()
     recovery_file = os.path.join(get_pgdata(), "recovery.conf")
-    recovery_tpl = get_recovery_pcmk()
-    # primary_conninfo often has a virtual IP to reach the master. There is no
-    # master available at startup, so standbies will complain about failing to
-    # connect. This is normal.
-    try:
-        with open(recovery_tpl) as fh:
-            # Copy all parameters from the template file
-            recovery_conf_tpl = fh.read()
-    except:
-        log_crit("can't open {}", recovery_tpl)
-        sys.exit(OCF_ERR_CONFIGURED)
     try:
         with open(recovery_file) as fh:
             recovery_conf_old = fh.read()
     except:
         recovery_conf_old = None
-    recovery_conf_new = replace_conninfo_host(recovery_conf_tpl, master)
+    new_conf = ("standby_mode = 'on'\n"
+                "recovery_target_timeline = 'latest'\n")
+    if master and master != this_host:
+        new_conf += (
+            "primary_conninfo = 'host={} port={} user={}'\n"
+            "primary_slot_name = '{}'\n").format(
+                master, get_pgport(), get_pguser(),
+                get_ocf_nodename().replace("-", "_"))
     log_debug("previous {}:\n{}", recovery_file, recovery_conf_old)
-    if recovery_conf_old == recovery_conf_new:
+    if recovery_conf_old == new_conf:
         log_debug("{} already as wanted, no need to udpate it", recovery_file)
         return False
+    log_debug("writing updated {}:\n{}", recovery_file, new_conf)
     try:
-        log_debug("writing updated {}:\n{}", recovery_file, recovery_conf_new)
         with open(recovery_file, "w") as fh:
-            fh.write(recovery_conf_new)
+            fh.write(new_conf)
     except:
         log_crit("can't open {}", recovery_file)
         sys.exit(OCF_ERR_CONFIGURED)
@@ -852,32 +829,6 @@ def ocf_validate_all():
     if ver < MIN_PG_VER:
         log_err("PostgreSQL {} is too old: >= {} required", ver, MIN_PG_VER)
         sys.exit(OCF_ERR_INSTALLED)
-    # check recovery template
-    recovery_tpl = get_recovery_pcmk()
-    if not os.path.isfile(recovery_tpl):
-        log_crit("Recovery template {} not found".format(recovery_tpl))
-        sys.exit(OCF_ERR_ARGS)
-    try:
-        with open(recovery_tpl) as f:
-            content = f.read()
-    except:
-        log_crit("Could not open or read file {}".format(recovery_tpl))
-        sys.exit(OCF_ERR_ARGS)
-    if not re.search(RE_TPL_STANDBY_MODE, content, re.M):
-        log_crit("standby_mode not 'on' in {}", recovery_tpl)
-        sys.exit(OCF_ERR_ARGS)
-    if not re.search(RE_TPL_TIMELINE, content, re.M):
-        log_crit("recovery_target_timeline not 'latest' in {}", recovery_tpl)
-        sys.exit(OCF_ERR_ARGS)
-    finds = re.findall(RE_TPL_SLOT, content, re.M)
-    if not finds:
-        log_crit("primary_slot_name missing from {}", recovery_tpl)
-        sys.exit(OCF_ERR_ARGS)
-    expected_slot_name = get_ocf_nodename().replace("-", "_")
-    if not finds[0] == expected_slot_name:
-        log_crit("unexpected primary_slot_name in {}; expected {}, found {}",
-                 recovery_tpl, expected_slot_name, finds[0])
-        sys.exit(OCF_ERR_ARGS)
     try:
         pwd.getpwnam(get_pguser())
     except KeyError:
