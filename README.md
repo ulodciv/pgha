@@ -60,7 +60,7 @@ it and shutting it down. This would be sufficient only if the promoted slave was
 all WAL caught up with the master that crashed.
 
 - RA should report a slave that doesn't replicate because its
-timeline diverged as down. Perhaps this should bring the whole resource down. 
+timeline diverged as failed. Perhaps this should bring the whole resource down. 
 Technically, this should not occur, however, because the RA is suppose to prevent this. 
 	
         LOG:  fetching timeline history file for timeline 3 from primary server
