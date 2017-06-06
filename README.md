@@ -9,7 +9,7 @@ multi-state Pacemaker Resource Agent (RA) for Postgresql.
 
        cp pgha.py /usr/lib/ocf/resource.d/heartbeat/pgha
        
-2. Setup the resource. Adapts parameters as required (e.g. pgbindir, pgdata):
+2. Setup the resource with correct settings (e.g. pgbindir, pgdata):
 
        pcs -f cluster.xml resource create pg \
        ocf:heartbeat:pgha \
