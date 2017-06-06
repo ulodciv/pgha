@@ -3,9 +3,34 @@
 A modified Python translation of [PAF](https://github.com/dalibo/PAF), a 
 multi-state Pacemaker Resource Agent (RA) for Postgresql.
 
-##  Some differences between PAF (pgsqlms) and pgha
+### Usage
+
+1. Install the resource agent (RA):
+
+       cp pgha.py /usr/lib/ocf/resource.d/heartbeat/pgha
+       
+2. Setup the resource. Adapts parameters as required (e.g. pgbindir, pgdata):
+
+       pcs -f cluster.xml resource create pg \
+       ocf:heartbeat:pgha \
+       pgbindir=/usr/pgsql-9.6/bin \
+       pgdata=/var/lib/pgsql/9.6/data \
+       pgconf=/var/lib/pgsql/9.6/data/postgresql.conf \
+       pgport=5432 \
+       pghost=/tmp \
+       op start timeout=60s \
+       op stop timeout=60s \
+       op promote timeout=120s \
+       op demote timeout=120s \
+       op monitor interval=10s timeout=10s role="Master" \
+       op monitor interval=11s timeout=10s role="Slave" \
+       op notify timeout=60s
+
+###  Some differences between PAF (pgsqlms) and pgha
 
 - pgha uses replication slots, pgsqlms does not
+- pgsqlms requires a virtual IP directing to the master instance of Postgresql,
+pgha does not
 - when promoting a master:
     - pgha:
         - updates 'host' in 'primary_conninfo' in recovery.conf on slaves
@@ -26,7 +51,7 @@ pgha does not
 shutdown checkpoint, pgha does not
 
 
-## TODO
+### TODO
 
 - Untangle code by eliminating all calls to get_ocf_state.
 
