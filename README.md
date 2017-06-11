@@ -43,12 +43,14 @@ pgha does not
 - pgsqlms needs application_name to be set in primary_conninfo in recovery.conf, 
 pgha does not
 - pgha requires PG >= 9.6, pgsqlms requires PG >= 9.3
-- pgha gets WAL LSN from pg_last_xlog_replay_location, pgsqlms gets it from 
-pg_last_xlog_receive_location
+- pgha gets WAL LSN of standbies using 
+GREATEST(pg_last_xlog_receive_location(), pg_last_xlog_replay_location()), pgsqlms 
+gets it from pg_last_xlog_receive_location()
 - pgsqlms sets a negative score to standbies that lag too much (lag > maxlag), 
 pgha does not
-- pgsqlms checks, during pre-promote, that the slave being promoted has the 
-shutdown checkpoint, pgha does not
+- pgsqlms checks, during pre-promote, only after a successful demotion (ie not 
+after the master crashed), that the slave being promoted has the shutdown 
+checkpoint, pgha does not
 
 
 ### TODO

@@ -225,7 +225,8 @@ def get_ha_private_attr(name, node=None):
     if node:
         cmd.extend(["-N", node])
     try:
-        ans = check_output(cmd)
+        with open(os.devnull, 'w') as null_fh:
+            ans = check_output(cmd, stderr=null_fh)
     except CalledProcessError:
         return ""
     p = re.compile(r'^name=".*"\s+host=".*"\s+value="(.*)"$')
@@ -244,7 +245,10 @@ def set_ha_private_attr(name, val, node=None):
 
 def del_ha_private_attr(name):
     # option "-p" must be present, but I don't know why
-    return call([get_attrd_updater(), "-D", "-n", name, "-p", "-d", "0"]) == 0
+    with open(os.devnull, "w") as null_fh:
+        return call(
+            [get_attrd_updater(), "-D", "-n", name, "-p", "-d", "0"],
+            stderr=null_fh) == 0
 
 
 def run_pgctrldata():
@@ -279,9 +283,9 @@ def as_postgres_user():
 def as_postgres(cmd):
     cmd = [str(c) for c in cmd]
     log_debug("as {}: {}", get_pguser(), " ".join(cmd))
-    with open(os.devnull, "w") as DEVNULL:
+    with open(os.devnull, "w") as null_fh:
         return call(
-            cmd, preexec_fn=as_postgres_user, stdout=DEVNULL, stderr=STDOUT)
+            cmd, preexec_fn=as_postgres_user, stdout=null_fh, stderr=STDOUT)
 
 
 def pg_execute(query):
@@ -562,7 +566,9 @@ def set_promotion_score(score, node=None):
     cmd = [get_crm_master(), "-q", "-v", score]
     if node:
         cmd.extend(["-N", node])
-    call(" ".join(cmd), shell=True)
+    cmd = " ".join(cmd)
+    log_debug(cmd)
+    call(cmd, shell=True)
     # setting attributes is asynchronous, so return as soon as truly done
     while True:
         tmp = get_promotion_score(node)
@@ -667,7 +673,8 @@ def delete_replication_slots():
         return True
     for slot in [r[0] for r in rs]:
         kill_wal_sender(slot)
-        rc, rs = pg_execute("SELECT pg_drop_replication_slot('{}')".format(slot))
+        q = "SELECT pg_drop_replication_slot('{}')".format(slot)
+        rc, rs = pg_execute(q)
         if rc != 0:
             log_err("failed to delete replication slot {}".format(slot))
             return False
@@ -681,33 +688,33 @@ def confirm_this_node_should_be_promoted(active_nodes):
     The standby with the highest master score gets promoted, as set by the
     master during the last monitor (see set_standbies_scores). Confirm that
     these scores are still correct in that this node still has the most advanced
-    WAL record. All slaves should have set "replay_lsn" during pre-promote.
+    WAL record. All slaves should have set "wal_lsn" during pre-promote.
     Return True if this node is to be promoted, False otherwise """
     log_debug("checking if current node is the best for promotion")
     # Exclude nodes that are not in the current partition
     local_node = get_ocf_nodename()
     node_to_promote = local_node
-    local_lsn = get_ha_private_attr("replay_lsn")  # set during pre-promote
+    local_lsn = get_ha_private_attr("wal_lsn")  # set during pre-promote
     if local_lsn == "":
-        log_crit("no replay LSN for this node")
+        log_crit("no WAL LSN for this node")
         return False
     # convert LSN to a pair of integers
     local_lsn = [int(v, 16) for v in local_lsn.split("/")]
     highest_lsn = local_lsn
-    log_debug("replay LSN for this node: {}", local_lsn)
+    log_debug("WAL LSN for this node: {}", local_lsn)
     # Now we compare with the other available nodes.
     for node in (n for n in active_nodes if n != local_node):
-        node_lsn = get_ha_private_attr("replay_lsn", node)
+        node_lsn = get_ha_private_attr("wal_lsn", node)
         if node_lsn == "":
-            log_crit("no replay LSN for {}", node)
+            log_crit("no WAL LSN for {}", node)
             return False
         # convert LSN to decimal
         node_lsn = [int(v, 16) for v in node_lsn.split("/")]
-        log_debug("replay LSN for {}: {}", node, node_lsn)
+        log_debug("WAL LSN for {}: {}", node, node_lsn)
         if node_lsn > highest_lsn:
             node_to_promote = node
             highest_lsn = node_lsn
-            log_debug("{}'s replay LSN is higher", node)
+            log_debug("{}'s WAL LSN is higher", node)
     if node_to_promote != local_node:
         log_info("{} is the best standby to promote, aborting promotion",
                  node_to_promote)
@@ -719,19 +726,22 @@ def confirm_this_node_should_be_promoted(active_nodes):
 
 
 def del_private_attributes():
-    del_ha_private_attr("replay_lsn")
+    del_ha_private_attr("wal_lsn")
     del_ha_private_attr("master_promotion")
     del_ha_private_attr("active_nodes")
     del_ha_private_attr("cancel_promotion")
 
 
-def get_replay_lsn():
+def get_lsn():
     if get_pg_version() >= LooseVersion("10"):
-        rc, rs = pg_execute("SELECT pg_last_wal_replay_lsn()")
+        q = ("SELECT GREATEST("
+             "pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())")
     else:
-        rc, rs = pg_execute("SELECT pg_last_xlog_replay_location()")
+        q = ("SELECT GREATEST("
+             "pg_last_xlog_receive_location(), pg_last_xlog_replay_location())")
+    rc, rs = pg_execute(q)
     if rc != 0:
-        log_warn("could not get WAL replay LSN")
+        log_warn("could not get WAL LSN")
         return None
     return rs[0][0]
 
@@ -749,18 +759,18 @@ def notify_pre_promote(nodes):
 
     # FIXME: should we allow a switchover to a lagging standby?
 
-    # Run an election among slaves to promote the best one based on replay LSNs.
+    # Run an election among slaves to promote the best one based on WAL LSNs.
     # This information is used during ocf_promote to check if the promoted node
     # is the best one. If not, the promotion will be "cancelled" (which will
     # allow the best slave to be promoted subsequently)
-    node_lsn = get_replay_lsn()
+    node_lsn = get_lsn()
     if node_lsn is None:
         return
-    log_info("WAL replay LSN: {}", node_lsn)
-    # Set the "replay_lsn" attribute value for this node so we can use it
+    log_info("WAL LSN: {}", node_lsn)
+    # Set the "wal_lsn" attribute value for this node so we can use it
     # during the following "promote" action.
-    if not set_ha_private_attr("replay_lsn", node_lsn):
-        log_warn("could not set the WAL replay LSN")
+    if not set_ha_private_attr("wal_lsn", node_lsn):
+        log_warn("could not set the WAL LSN")
     # If this node is the future master, keep track of the slaves that received
     # the same notification to compare our LSN with them during promotion
     if this_node in nodes["promote"]:
@@ -1168,7 +1178,8 @@ def ocf_notify():
     type_op = (os.environ.get("OCF_RESKEY_CRM_meta_notify_type", "") + "-" +
                os.environ.get("OCF_RESKEY_CRM_meta_notify_operation", ""))
     unames = get_nofify_unames()
-    log_debug("{}:\n{}", type_op, json.dumps(unames, indent=2, sort_keys=True))
+    log_debug("{}:\n{}", type_op, json.dumps(
+        {k: v for k, v in unames.iteritems() if v}, indent=2, sort_keys=True))
     for state in list(unames):
         unames[state] = set(unames[state])
     if type_op == "pre-promote":
