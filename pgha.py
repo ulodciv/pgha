@@ -2,6 +2,7 @@
 from __future__ import division, print_function, unicode_literals
 import json
 import os
+import pipes
 import pwd
 import re
 import sys
@@ -116,6 +117,8 @@ methods
 meta-data
 validate-all"""
 ACTION = sys.argv[1] if len(sys.argv) > 1 else None
+RS = chr(30)  # record separator
+FS = chr(3)  # end of text
 _logtag = None
 _ocf_nodename = None
 _pg_version = None
@@ -171,7 +174,7 @@ def get_ha_debuglog():
 
 
 def get_crm_master():
-    return os.path.join(get_ha_bin(), "crm_master") + " --lifetime forever"
+    return os.path.join(get_ha_bin(), "crm_master")
 
 
 def get_crm_node():
@@ -240,29 +243,41 @@ def set_ha_private_attr(name, val, node=None):
     cmd = [get_attrd_updater(), "-U", val, "-n", name, "-p", "-d", "0"]
     if node:
         cmd.extend(["-N", node])
+    log_cmd(cmd)
     return call(cmd) == 0
 
 
 def del_ha_private_attr(name):
     # option "-p" must be present, but I don't know why
+    cmd = [get_attrd_updater(), "-D", "-n", name, "-p", "-d", "0"]
+    log_cmd(cmd)
     with open(os.devnull, "w") as null_fh:
-        return call(
-            [get_attrd_updater(), "-D", "-n", name, "-p", "-d", "0"],
-            stderr=null_fh) == 0
+        return call(cmd, stderr=null_fh) == 0
 
 
 def run_pgctrldata():
     try:
-        return check_output([get_pgctrldata(), get_pgdata()])
+        cmd = [get_pgctrldata(), get_pgdata()]
+        log_cmd(cmd)
+        return check_output(cmd)
     except CalledProcessError as e:
         return e.output
+
+
+def log_cmd(cmd, user=None):
+    prefix = "as {}: ".format(user) if user else ""
+    if isinstance(cmd, list) or isinstance(cmd, tuple):
+        cmd = " ".join(pipes.quote(c) for c in cmd)
+    log_debug(prefix + cmd.replace(RS, "<RS>").replace(FS, "<FS>"))
 
 
 def get_ocf_nodename():
     global _ocf_nodename
     if not _ocf_nodename:
         try:
-            _ocf_nodename = check_output([get_crm_node(), "-n"]).strip()
+            cmd = [get_crm_node(), "-n"]
+            log_cmd(cmd)
+            _ocf_nodename = check_output(cmd).strip()
         except CalledProcessError:
             sys.exit(OCF_ERR_GENERIC)
     return _ocf_nodename
@@ -282,15 +297,13 @@ def as_postgres_user():
 
 def as_postgres(cmd):
     cmd = [str(c) for c in cmd]
-    log_debug("as {}: {}", get_pguser(), " ".join(cmd))
+    log_cmd(cmd, get_pguser())
     with open(os.devnull, "w") as null_fh:
         return call(
             cmd, preexec_fn=as_postgres_user, stdout=null_fh, stderr=STDOUT)
 
 
 def pg_execute(query):
-    RS = chr(30)  # record separator
-    FS = chr(3)  # end of text
     try:
         tmp_fh, tmp_file = tempfile.mkstemp(prefix="pgsqlms-")
         os.write(tmp_fh, query)
@@ -303,7 +316,7 @@ def pg_execute(query):
         cmd = [
             get_psql(), "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-qXAtf",
             tmp_file, "-R", RS, "-F", FS, "-p", get_pgport(), "-h", get_pghost()]
-        log_debug(" ".join(cmd).replace(RS, "<RS>").replace(FS, "<FS>"))
+        log_cmd(cmd, get_pguser())
         ans = check_output(cmd, preexec_fn=as_postgres_user)
     except CalledProcessError as e:
         log_debug("psql error, return code: {}", e.returncode)
@@ -327,7 +340,9 @@ def pg_execute(query):
 
 def get_ha_nodes():
     try:
-        return check_output([get_crm_node(), "-p"]).split()
+        cmd = [get_crm_node(), "-p"]
+        log_cmd(cmd)
+        return check_output(cmd).split()
     except CalledProcessError as e:
         log_err("{} failed with return code {}", e.cmd, e.returncode)
         sys.exit(OCF_ERR_GENERIC)
@@ -399,10 +414,10 @@ def is_master_or_standby():
     if rc == 0:
         is_in_recovery = rs[0][0]
         if is_in_recovery == "t":
-            log_debug("PG is a running as a standby")
+            log_debug("PG running as a standby")
             return OCF_SUCCESS
         else:  # is_in_recovery == "f":
-            log_debug("PG is running as a master")
+            log_debug("PG running as a master")
             return OCF_RUNNING_MASTER
     elif rc in (1, 2):
         # psql cound not connect; pg_isready reported PG is listening, so this
@@ -523,7 +538,7 @@ def create_recovery_conf(master):
                 get_ocf_nodename().replace("-", "_"))
     log_debug("previous {}:\n{}", recovery_file, recovery_conf_old)
     if recovery_conf_old == new_conf:
-        log_debug("{} already as wanted, no need to udpate it", recovery_file)
+        log_debug("recovery.conf already as wanted, no need to udpate it")
         return False
     log_debug("writing updated {}:\n{}", recovery_file, new_conf)
     try:
@@ -541,11 +556,13 @@ def create_recovery_conf(master):
 
 
 def get_promotion_score(node=None):
-    cmd = [get_crm_master(), "--quiet", "--get-value"]
+    cmd = [get_crm_master(), "--lifetime", "forever", "--quiet", "--get-value"]
     if node:
         cmd.extend(["-N", node])
     try:
-        score = check_output(" ".join(cmd), shell=True)
+        log_cmd(cmd)
+        with open(os.devnull, 'w') as null_fh:
+            score = check_output(cmd, stderr=null_fh)
     except CalledProcessError:
         return ""
     return score.strip()
@@ -563,12 +580,11 @@ def no_node_has_a_positive_score():
 
 def set_promotion_score(score, node=None):
     score = str(score)
-    cmd = [get_crm_master(), "-q", "-v", score]
+    cmd = [get_crm_master(), "--lifetime", "forever", "-q", "-v", score]
     if node:
         cmd.extend(["-N", node])
-    cmd = " ".join(cmd)
-    log_debug(cmd)
-    call(cmd, shell=True)
+    log_cmd(cmd)
+    call(cmd)
     # setting attributes is asynchronous, so return as soon as truly done
     while True:
         tmp = get_promotion_score(node)
@@ -586,7 +602,6 @@ def ocf_promote():
     elif state != OCF_SUCCESS:
         log_err("Unexpected error, cannot promote this node")
         return OCF_ERR_GENERIC
-    log_debug("PG running as a standby")
     # Cancel if it has been considered unsafe during pre-promote
     if get_ha_private_attr("cancel_promotion") == "1":
         log_err("Promotion was cancelled during pre-promote")
@@ -690,7 +705,7 @@ def confirm_this_node_should_be_promoted(active_nodes):
     these scores are still correct in that this node still has the most advanced
     WAL record. All slaves should have set "wal_lsn" during pre-promote.
     Return True if this node is to be promoted, False otherwise """
-    log_debug("checking if current node is the best for promotion")
+    log_debug("checking if current node is best for promotion")
     # Exclude nodes that are not in the current partition
     local_node = get_ocf_nodename()
     node_to_promote = local_node
@@ -906,7 +921,7 @@ def ocf_stop():
         log_warn("unexpected PG state: {}", rc)
         return OCF_ERR_GENERIC
     # From here, the instance is running for sure
-    log_debug("PG is running, stopping it")
+    log_debug("PG running, stopping it")
     # Try to quit with proper shutdown.
     # insanely long timeout to ensure Pacemaker gives up first
     if pg_ctl_stop() == 0:
