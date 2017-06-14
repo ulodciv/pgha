@@ -78,8 +78,6 @@ checkpoint, pgha does not
 
 ### TODO
 
-- Untangle code by eliminating all calls to get_ocf_state.
-
 - Explore how RA could try to clean up a crashed master instance by starting 
 it and shutting it down. This would be sufficient only if the promoted slave was
 all WAL caught up with the master that crashed.

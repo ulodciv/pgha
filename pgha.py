@@ -279,12 +279,8 @@ def get_ocf_nodename():
             log_cmd(cmd)
             _ocf_nodename = check_output(cmd).strip()
         except CalledProcessError:
-            sys.exit(OCF_ERR_GENERIC)
+            log_and_exit(OCF_ERR_GENERIC)
     return _ocf_nodename
-
-
-def run_pgisready():
-    return as_postgres([get_pgisready(), "-h", get_pghost(), "-p", get_pgport()])
 
 
 def as_postgres_user():
@@ -311,7 +307,7 @@ def pg_execute(query):
         os.chmod(tmp_file, 0o644)
     except:
         log_crit("could not create or write in a temp file")
-        sys.exit(OCF_ERR_INSTALLED)
+        log_and_exit(OCF_ERR_INSTALLED)
     try:
         cmd = [
             get_psql(), "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-qXAtf",
@@ -345,7 +341,7 @@ def get_ha_nodes():
         return check_output(cmd).split()
     except CalledProcessError as e:
         log_err("{} failed with return code {}", e.cmd, e.returncode)
-        sys.exit(OCF_ERR_GENERIC)
+        log_and_exit(OCF_ERR_GENERIC)
 
 
 def set_standbies_scores():
@@ -370,7 +366,7 @@ def set_standbies_scores():
         "ORDER BY T1.restart_lsn DESC")
     if rc != 0:
         log_err("failed to get replication slots info")
-        sys.exit(OCF_ERR_GENERIC)
+        log_and_exit(OCF_ERR_GENERIC)
     # For each standby connected, set their master score based on the following
     # rule: the first known node, with the highest priority and
     # with an acceptable state.
@@ -438,37 +434,9 @@ def get_pgctrldata_state():
     finds = re.findall(RE_PG_CLUSTER_STATE, run_pgctrldata(), re.M)
     if not finds:
         log_crit("couldn't read state from controldata file for {}", datadir)
-        sys.exit(OCF_ERR_CONFIGURED)
+        log_and_exit(OCF_ERR_CONFIGURED)
     log_debug("PG state is '{}'", finds[0])
     return finds[0]
-
-
-def get_non_transitional_pg_state():
-    """ Loop until pg_controldata returns a non-transitional state.
-    Used to find out if this instance is a master or standby.
-    Return OCF_RUNNING_MASTER or OCF_SUCCESS or OCF_NOT_RUNNING  """
-    while True:
-        state = get_pgctrldata_state()
-        if state == "":
-            # Something went really wrong with pg_controldata.
-            log_err("empty PG cluster state")
-            sys.exit(OCF_ERR_INSTALLED)
-        if state == "in production":
-            return OCF_RUNNING_MASTER
-        # Hot or warm (rejects connections, including from pg_isready) standby
-        if state == "in archive recovery":
-            return OCF_SUCCESS
-        # stopped
-        if state in ("shut down",  # was a Master
-                     "shut down in recovery"  # was a standby
-                     ):
-            return OCF_NOT_RUNNING
-        # The state is "in crash recovery", "starting up" or "shutting down".
-        # This state should be transitional, so we wait and loop to check if
-        # it changes.
-        # If it does not, pacemaker will eventually abort with a timeout.
-        log_debug("waiting for transitionnal state '{}' to change", state)
-        sleep(1)
 
 
 def pg_ctl_status():
@@ -498,18 +466,6 @@ def pg_ctl_stop():
 
 def backup_label_exists():
     return os.path.isfile(os.path.join(get_pgdata(), "backup_label"))
-
-
-def confirm_stopped_with_pg_ctl_status():
-    """ PG is really stopped """
-    # Check the postmaster process status.
-    pgctlstatus_rc = pg_ctl_status()
-    if pgctlstatus_rc == 0:
-        # The PID file exists and the process is available.
-        # That should not be the case, return an error.
-        log_err("PG is not listening, but the process in postmaster.pid exists")
-        return False
-    return True
 
 
 def create_recovery_conf(master):
@@ -546,12 +502,12 @@ def create_recovery_conf(master):
             fh.write(new_conf)
     except:
         log_crit("can't open {}", recovery_file)
-        sys.exit(OCF_ERR_CONFIGURED)
+        log_and_exit(OCF_ERR_CONFIGURED)
     try:
         os.chown(recovery_file, uid, gid)
     except:
         log_crit("can't set owner of {}", recovery_file)
-        sys.exit(OCF_ERR_CONFIGURED)
+        log_and_exit(OCF_ERR_CONFIGURED)
     return True
 
 
@@ -618,7 +574,7 @@ def ocf_promote():
         # The best standby to promote has the highest LSN. If this node
         # is not the best one, we need to modify the master scores accordingly,
         # and abort the current promotion
-        if not confirm_this_node_should_be_promoted(active_nodes):
+        if not is_this_node_best_promotion_candidate(active_nodes):
             return OCF_ERR_GENERIC
 
     # replication slots can be added on hot standbies, helps ensuring no WAL is
@@ -697,31 +653,32 @@ def delete_replication_slots():
     return True
 
 
-def confirm_this_node_should_be_promoted(active_nodes):
+def is_this_node_best_promotion_candidate(active_nodes):
     """ Find out if this node is truly the one to promote. If not, also update
     the scores.
-    The standby with the highest master score gets promoted, as set by the
-    master during the last monitor (see set_standbies_scores). Confirm that
-    these scores are still correct in that this node still has the most advanced
-    WAL record. All slaves should have set "wal_lsn" during pre-promote.
+    The standby with the highest master score gets promoted by pacemaker, as set
+    by the master during monitor (see set_standbies_scores). Confirm that
+        - all standbies have set "wal_lsn" during pre-promote; and
+        - this standby has the highest "wal_lsn"
     Return True if this node is to be promoted, False otherwise """
-    log_debug("checking if current node is best for promotion")
+    log_debug("checking that this node is the best candidate for promotion")
     # Exclude nodes that are not in the current partition
     local_node = get_ocf_nodename()
     node_to_promote = local_node
     local_lsn = get_ha_private_attr("wal_lsn")  # set during pre-promote
     if local_lsn == "":
-        log_crit("no WAL LSN for this node")
+        log_crit("this node isn't the best candidate: no WAL LSN")
         return False
     # convert LSN to a pair of integers
     local_lsn = [int(v, 16) for v in local_lsn.split("/")]
     highest_lsn = local_lsn
-    log_debug("WAL LSN for this node: {}", local_lsn)
+    log_debug("WAL LSN of this node: {}", local_lsn)
     # Now we compare with the other available nodes.
     for node in (n for n in active_nodes if n != local_node):
         node_lsn = get_ha_private_attr("wal_lsn", node)
         if node_lsn == "":
-            log_crit("no WAL LSN for {}", node)
+            log_crit("can't confirm this node is the best candidate: "
+                     "no WAL LSN set for {}", node)
             return False
         # convert LSN to decimal
         node_lsn = [int(v, 16) for v in node_lsn.split("/")]
@@ -731,12 +688,13 @@ def confirm_this_node_should_be_promoted(active_nodes):
             highest_lsn = node_lsn
             log_debug("{}'s WAL LSN is higher", node)
     if node_to_promote != local_node:
-        log_info("{} is the best standby to promote, aborting promotion",
+        log_info("{} is the best candidate, aborting promotion",
                  node_to_promote)
         set_promotion_score("1")  # minimize local node's score
         set_promotion_score("1000", node_to_promote)
         # Make promotion fail; another one will occur with updated scores
         return False
+    log_info("this node is the best candidate, proceeding with promotion")
     return True
 
 
@@ -825,54 +783,44 @@ def get_pg_version():
                 ver = fh.read()
         except Exception as e:
             log_crit("Can't read PG version file: {}", ver_file, e)
-            sys.exit(OCF_ERR_ARGS)
+            log_and_exit(OCF_ERR_ARGS)
         try:
             _pg_version = LooseVersion(ver)
         except:
             log_crit("Can't parse PG version: {}", ver)
-            sys.exit(OCF_ERR_ARGS)
+            log_and_exit(OCF_ERR_ARGS)
     return _pg_version
 
 
 def ocf_validate_all():
     if int(os.environ.get("OCF_RESKEY_CRM_meta_clone_max", 0)) <= 0:
         log_err("OCF_RESKEY_CRM_meta_clone_max should be >= 1")
-        sys.exit(OCF_ERR_CONFIGURED)
+        log_and_exit(OCF_ERR_CONFIGURED)
     if os.environ.get("OCF_RESKEY_CRM_meta_master_max", "") != "1":
         log_err("OCF_RESKEY_CRM_meta_master_max should == 1")
-        sys.exit(OCF_ERR_CONFIGURED)
+        log_and_exit(OCF_ERR_CONFIGURED)
     for prog in [get_pgctl(), get_psql(), get_pgisready(), get_pgctrldata()]:
         if not os.access(prog, os.X_OK):
             log_crit("{} is missing or not executable", prog)
-            sys.exit(OCF_ERR_INSTALLED)
+            log_and_exit(OCF_ERR_INSTALLED)
     datadir = get_pgdata()
     if not os.path.isdir(datadir):
         log_err("PGDATA {} not found".format(datadir))
-        sys.exit(OCF_ERR_ARGS)
-    # check PG_VERSION
+        log_and_exit(OCF_ERR_ARGS)
     ver = get_pg_version()
     if ver < MIN_PG_VER:
         log_err("PostgreSQL {} is too old: >= {} required", ver, MIN_PG_VER)
-        sys.exit(OCF_ERR_INSTALLED)
+        log_and_exit(OCF_ERR_INSTALLED)
     try:
         pwd.getpwnam(get_pguser())
     except KeyError:
         log_crit("System user {} does not exist", get_pguser())
-        sys.exit(OCF_ERR_ARGS)
-    # require wal_level >= hot_standby
-    # rc, rs = pg_execute("SHOW wal_level")
-    # if rc != 0:
-    #     log_crit("Could not get wal_level setting")
-    #     sys.exit(OCF_ERR_ARGS)
-    # if rs[0][0] not in ("logical", "replica"):
-    #     log_crit("wal_level must be replica, or higher (logical); "
-    #              "currently set to {}", rs[0][0])
-    #     sys.exit(OCF_ERR_ARGS)
+        log_and_exit(OCF_ERR_ARGS)
     return OCF_SUCCESS
 
 
 def ocf_start():
-    """ Start as a standby """
+    """ Start as a hot standby """
     rc = get_ocf_state()
     # Instance must be stopped or running as standby
     if rc == OCF_SUCCESS:
@@ -897,9 +845,6 @@ def start_pg_as_standby(master):
         log_err("PG is not running as a standby (returned {})", rc)
         return OCF_ERR_GENERIC
     log_info("PG started")
-    # if not delete_replication_slots():
-    #     log_err("failed to delete replication slots")
-    #     return OCF_ERR_GENERIC
     # On first cluster start, no score exists on standbies unless someone sets
     # them with crm_master. Without scores, the cluster won't promote any slave.
     # Fix that by setting a score of 1, but only if this node was a master
@@ -913,7 +858,6 @@ def start_pg_as_standby(master):
 def ocf_stop():
     """ Return OCF_SUCCESS or OCF_ERR_GENERIC """
     rc = get_ocf_state()
-    # is_master_or_standby
     if rc == OCF_NOT_RUNNING:
         log_info("PG already stopped")
         return OCF_SUCCESS
@@ -922,8 +866,7 @@ def ocf_stop():
         return OCF_ERR_GENERIC
     # From here, the instance is running for sure
     log_debug("PG running, stopping it")
-    # Try to quit with proper shutdown.
-    # insanely long timeout to ensure Pacemaker gives up first
+    # Try to quit with proper shutdown (won't return if stop never finishes)
     if pg_ctl_stop() == 0:
         log_info("PG stopped")
         return OCF_SUCCESS
@@ -931,134 +874,78 @@ def ocf_stop():
     return OCF_ERR_GENERIC
 
 
-def loop_until_pgisready():
+def run_pgisready():
+    """
+    pg_isready returns
+        0 to the shell if the server is accepting connections normally,
+        1 if the server is rejecting connections (for example during startup),
+        2 if there was no response to the connection attempt, and
+        3 if no attempt was made (for example due to invalid parameters).
+    """
+    return as_postgres([
+        get_pgisready(), "-h", get_pghost(), "-p", get_pgport(), "-q"])
+
+
+def loop_while_pg_rejects_connections():
+    """ return True if PG accepts connections
+        return False if PG is mute to connection attempts """
     while True:
         rc = run_pgisready()
+        if rc == 3:
+            log_err("pg_isready reports invalid parameters, "
+                    "or something of the sort (exit status 3)")
+            log_and_exit(OCF_ERR_CONFIGURED)
+        if rc == 1:
+            sleep(0.5)
+            continue
         if rc == 0:
-            return
-        sleep(1)
+            return True
+        return False  # should mean rc == 2 (see pg_isready docs)
 
 
 def ocf_monitor():
-    pgisready_rc = run_pgisready()
-    if pgisready_rc == 0:
-        log_debug("PG is listening, checking if it is a master or standby")
+    if loop_while_pg_rejects_connections():
+        log_debug("PG is listening")
         status = is_master_or_standby()
         if status == OCF_RUNNING_MASTER:
             set_standbies_scores()
         return status
-    if pgisready_rc == 1:
-        # PG rejects connections. In normal circumstances, this should only
-        # happen on a standby that was just started until it has completed
-        # sufficient recovery to provide a consistent state against which
-        # queries can run
-        log_warn("PG server is running but refuses connections. "
-                 "This should only happen on a standby that was just started.")
-        loop_until_pgisready()
-        if is_master_or_standby() == OCF_SUCCESS:
-            log_info("PG now accepts connections, and it is a standby")
-            return OCF_SUCCESS
-        log_err("PG now accespts connections, but it is not a standby")
+    log_info("PG is not listening; check if it is running with 'pg_ctl status'")
+    if pg_ctl_status() == 0:
+        log_err("PG is running yet it isn't listening")
         return OCF_ERR_GENERIC
-    if pgisready_rc == 2:  # PG is not listening.
-        log_info("pg_isready says PG is not listening; 'pg_ctl status' will "
-                 "tell if the server is running")
-        if pg_ctl_status() == 0:
-            log_info("'pg_ctl status' says the server is running")
-            log_err("PG is not listening, but the server is running")
-            return OCF_ERR_GENERIC
-        log_info("'pg_ctl status' says the server is not running")
-        if backup_label_exists():
-            log_debug("found backup_label: indicates a never started backup")
-            return OCF_NOT_RUNNING
-        log_debug("no backup_label found: let's check pg_controldata's state "
-                  "to infer if the shutdown was graceful")
-        state = get_pgctrldata_state()
-        log_info("pg_controldata's state is: {}", state)
-        if state in ("shut down",  # was a Master
-                     "shut down in recovery"  # was a standby
-                     ):
-            log_debug("shutdown was graceful")
-        else:
-            log_warn("shutdown was not graceful")
+    log_info("PG isn't running")
+    if backup_label_exists():
+        log_debug("found backup_label: indicates a never started backup")
         return OCF_NOT_RUNNING
-    log_err("unexpected pg_isready exit code {} ", pgisready_rc)
-    return OCF_ERR_GENERIC
+    log_debug("backup_label not found: check pg_controldata's state "
+              "to find out if PG was shutdown gracefully")
+    state = get_pgctrldata_state()
+    log_info("pg_controldata's state is: {}", state)
+    if state in ("shut down",  # was a Master
+                 "shut down in recovery"  # was a standby
+                 ):
+        log_debug("shutdown was graceful")
+    else:
+        log_warn("shutdown was not graceful")
+    return OCF_NOT_RUNNING
 
 
 def get_ocf_state():
-    pgisready_rc = run_pgisready()
-    if pgisready_rc == 0:
+    """ Return OCF_SUCCESS or OCF_RUNNING_MASTER if PG is running and accepts
+    connections,
+    OCF_NOT_RUNNING if PG is not running, and
+    OCF_ERR_GENERIC if PG is running but doesn't accept or reject connections
+    """
+    if loop_while_pg_rejects_connections():
         log_debug("PG is listening")
         return is_master_or_standby()
-    if pgisready_rc == 1:
-        # The attempt was rejected.
-        # There are different reasons for this:
-        #   - startup in progres
-        #   - shutdown in progress
-        #   - in crash recovery
-        #   - instance is a warm standby
-        # Except for the warm standby case, this should be a transitional state.
-        # We try to confirm using pg_controldata.
-        log_debug("PG rejects connections, checking again...")
-        controldata_rc = get_non_transitional_pg_state()
-        if controldata_rc in (OCF_RUNNING_MASTER, OCF_SUCCESS):
-            # This state indicates that pg_isready check should succeed.
-            # We check again.
-            log_debug("PG's controldata shows a running status")
-            pgisready_rc = run_pgisready()
-            if pgisready_rc == 0:
-                # Consistent with pg_controdata output.
-                # We can check if the instance is master or standby
-                log_debug("PG is listening")
-                return is_master_or_standby()
-            # Still not consistent, raise an error.
-            # NOTE: if the instance is a warm standby, we end here.
-            # TODO raise a hard error here ?
-            log_err("PG's controldata is not consistent with pg_isready "
-                    "(returned: {})", pgisready_rc)
-            log_info("if this instance is in warm standby, "
-                     "this resource agent only supports hot standby")
-            return OCF_ERR_GENERIC
-        if controldata_rc == OCF_NOT_RUNNING:
-            # This state indicates that pg_isready check should fail with rc 2.
-            # We check again.
-            pgisready_rc = run_pgisready()
-            if pgisready_rc == 2:
-                # Consistent with pg_controdata output.
-                # We check the process status using pg_ctl status and check
-                # if it was propertly shut down using pg_controldata.
-                log_debug("PG is not listening")
-                if confirm_stopped_with_pg_ctl_status():
-                    return OCF_NOT_RUNNING
-                else:
-                    return OCF_ERR_GENERIC
-            # Still not consistent, raise an error.
-            # TODO raise an hard error here ?
-            log_err("PG's controldata is not consistent "
-                    "with pg_isready (returned: {})", pgisready_rc)
-            return OCF_ERR_GENERIC
-        # Something went wrong with the controldata check, hard fail.
-        log_err("could not get PG's status from "
-                "controldata (returned: {})", controldata_rc)
-        return OCF_ERR_INSTALLED
-    elif pgisready_rc == 2:
-        # The instance is not listening.
-        # We check the process status using pg_ctl status and check
-        # if it was propertly shut down using pg_controldata.
-        log_debug("PG is not listening")
-        if confirm_stopped_with_pg_ctl_status():
-            return OCF_NOT_RUNNING
-        else:
-            return OCF_ERR_GENERIC
-    elif pgisready_rc == 3:
-        # No attempt was done, probably a syntax error.
-        # Hard configuration error, we don't want to retry or failover here.
-        log_err("unknown error while checking if PG "
-                "is listening (returned {})", pgisready_rc)
-        return OCF_ERR_CONFIGURED
-    log_err("unexpected pg_isready status")
-    return OCF_ERR_GENERIC
+    log_debug("PG is not listening")
+    pgctlstatus_rc = pg_ctl_status()
+    if pgctlstatus_rc == 0:
+        log_err("PG is running but not listening")
+        return OCF_ERR_GENERIC
+    return OCF_NOT_RUNNING
 
 
 def notify_pre_demote(nodes):
