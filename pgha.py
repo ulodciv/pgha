@@ -564,26 +564,17 @@ def ocf_promote():
         del_ha_private_attr("cancel_promotion")
         return OCF_ERR_GENERIC
     active_nodes = get_ha_private_attr("active_nodes").split()
-    # Do not check for a better candidate if we try to recover the master
-    # Recovery of a master is detected during pre-promote. It is signaled by
-    # setting the 'master_promotion' flag.
-    if get_ha_private_attr("master_promotion") == "1":
-        log_info("promoting the previous master, no need to make sure this node"
-                 "is the most up to date")
-    else:
-        # The best standby to promote has the highest LSN. If this node
-        # is not the best one, we need to modify the master scores accordingly,
-        # and abort the current promotion
-        if not is_this_node_best_promotion_candidate(active_nodes):
-            return OCF_ERR_GENERIC
-
+    # The best standby to promote has the highest LSN. If this node
+    # is not the best one, we need to modify the master scores accordingly,
+    # and abort the current promotion
+    if not is_this_node_best_promotion_candidate(active_nodes):
+        return OCF_ERR_GENERIC
     # replication slots can be added on hot standbies, helps ensuring no WAL is
     # missed upon promotion
     slave_nodes = [n for n in active_nodes if n != get_ocf_nodename()]
     if not add_replication_slots(slave_nodes):
         log_err("failed to add all replication slots")
         return OCF_ERR_GENERIC
-
     if as_postgres([get_pgctl(), "promote", "-D", get_pgdata()]) != 0:
         # Promote the instance on the current node.
         log_err("'pg_ctl promote' failed")
@@ -700,7 +691,6 @@ def is_this_node_best_promotion_candidate(active_nodes):
 
 def del_private_attributes():
     del_ha_private_attr("wal_lsn")
-    del_ha_private_attr("master_promotion")
     del_ha_private_attr("active_nodes")
     del_ha_private_attr("cancel_promotion")
 
@@ -721,13 +711,8 @@ def get_lsn():
 
 def notify_pre_promote(nodes):
     this_node = get_ocf_nodename()
-    # No need to do an election between slaves if this is recovery of the master
-    if nodes["promote"] & nodes["master"]:
-        log_warn("this is a master recovery")
-        if this_node in nodes["promote"]:
-            set_ha_private_attr("master_promotion", "1")
-        return
-
+    if nodes["promote"] and nodes["master"]:
+        log_warn("looks like the previous master is being promoted back")
     del_private_attributes()
 
     # FIXME: should we allow a switchover to a lagging standby?
