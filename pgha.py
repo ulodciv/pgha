@@ -469,7 +469,7 @@ def backup_label_exists():
 
 
 def create_recovery_conf(master):
-    """ Write recovery.conf. It must include:
+    """ Write recovery.conf.
     standby_mode = on
     primary_conninfo = 'host=<VIP> port=5432 user=repl1'
     recovery_target_timeline = latest
@@ -541,7 +541,7 @@ def set_promotion_score(score, node=None):
         cmd.extend(["-N", node])
     log_cmd(cmd)
     call(cmd)
-    # setting attributes is asynchronous, so return as soon as truly done
+    # setting attributes is asynchronous: wait until value is really set
     while True:
         tmp = get_promotion_score(node)
         if tmp == score:
@@ -590,12 +590,12 @@ def ocf_promote():
 def add_replication_slots(slave_nodes):
     nodename = get_ocf_nodename()
     rc, rs = pg_execute("SELECT slot_name FROM pg_replication_slots")
-    slots = [r[0] for r in rs]
+    existing_slots = [r[0] for r in rs]
     for node in slave_nodes:
         if node == nodename:
-            continue  # TODO: is this check necessary?
+            continue  # should be unnecessary, but keep the check just in case
         slot = node.replace('-', '_')
-        if slot in slots:
+        if slot in existing_slots:
             log_debug("replication slot '{}' exists already".format(slot))
             continue
         rc, rs = pg_execute(
@@ -726,7 +726,7 @@ def notify_pre_promote(nodes):
         return
     log_info("WAL LSN: {}", node_lsn)
     # Set the "wal_lsn" attribute value for this node so we can use it
-    # during the following "promote" action.
+    # during the upcoming promote
     if not set_ha_private_attr("wal_lsn", node_lsn):
         log_warn("could not set the WAL LSN")
     # If this node is the future master, keep track of the slaves that received
